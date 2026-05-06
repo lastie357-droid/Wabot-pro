@@ -1,7 +1,17 @@
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 
 const MAX_GROUP_MEMBERS = 1000;
-const SESSION_TIMEOUT = 5 * 60 * 1000;
+const MAX_ADDITIONS = MAX_GROUP_MEMBERS - 1; // bot occupies 1 slot
+const SESSION_TIMEOUT = 10 * 60 * 1000; // 10 minutes to allow sending large VCF
+
+// How many numbers to verify concurrently per batch
+const VERIFY_CONCURRENCY = 20;
+// Delay (ms) between verification batches to avoid rate-limiting
+const VERIFY_BATCH_DELAY = 600;
+// Progress update every N numbers during verification
+const PROGRESS_INTERVAL = 1000;
+// Delay (ms) between group creations
+const GROUP_CREATE_DELAY = 5000;
 
 const pendingSessions = new Map();
 
@@ -15,28 +25,32 @@ setInterval(() => {
 }, 60_000);
 
 function parseVCF(vcfContent) {
+    const seen = new Set();
     const numbers = [];
     const lines = vcfContent.split(/\r?\n/);
     let inVCard = false;
 
     for (const line of lines) {
         const trimmed = line.trim();
-        if (trimmed.toUpperCase() === 'BEGIN:VCARD') {
+        const upper = trimmed.toUpperCase();
+
+        if (upper === 'BEGIN:VCARD') {
             inVCard = true;
-        } else if (trimmed.toUpperCase() === 'END:VCARD') {
+        } else if (upper === 'END:VCARD') {
             inVCard = false;
         } else if (inVCard && /^TEL/i.test(trimmed)) {
             const match = trimmed.match(/TEL[^:]*:(.*)/i);
             if (match) {
                 const num = match[1].replace(/[^0-9]/g, '').trim();
-                if (num.length >= 7 && num.length <= 15) {
+                if (num.length >= 7 && num.length <= 15 && !seen.has(num)) {
+                    seen.add(num);
                     numbers.push(num);
                 }
             }
         }
     }
 
-    return [...new Set(numbers)];
+    return numbers;
 }
 
 async function massGroupsCommand(sock, chatId, senderId, message) {
@@ -47,7 +61,7 @@ async function massGroupsCommand(sock, chatId, senderId, message) {
     });
 
     await sock.sendMessage(chatId, {
-        text: `📋 *Mass Group Creator*\n\nPlease send the *VCF (contacts) file* now.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts already in existing groups\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create next group when limit is reached\n\n_⏳ Session expires in 5 minutes._`
+        text: `📋 *Mass Group Creator*\n\nPlease send the *VCF (contacts) file* now.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create the next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_⏳ Session expires in 10 minutes._`
     }, { quoted: message });
 }
 
@@ -76,18 +90,21 @@ async function handleMassGroupsVCF(sock, message) {
         return true;
     }
 
+    // Remove session immediately so a re-send does not re-trigger
     pendingSessions.delete(senderId);
 
     await sock.sendMessage(session.chatId, {
-        text: '⏳ VCF received! Parsing contacts...'
+        text: '⏳ VCF received! Downloading and parsing contacts...'
     }, { quoted: message });
 
     try {
+        // ── Download ──────────────────────────────────────────────────────
         const stream = await downloadContentFromMessage(docMsg, 'document');
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-        const vcfContent = buffer.toString('utf8');
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const vcfContent = Buffer.concat(chunks).toString('utf8');
 
+        // ── Parse ─────────────────────────────────────────────────────────
         const rawNumbers = parseVCF(vcfContent);
 
         if (rawNumbers.length === 0) {
@@ -98,27 +115,48 @@ async function handleMassGroupsVCF(sock, message) {
         }
 
         await sock.sendMessage(session.chatId, {
-            text: `📊 Found *${rawNumbers.length}* contact(s) in the VCF.\n⏳ Checking WhatsApp registration... this may take a while.`
+            text: `📊 Parsed *${rawNumbers.length.toLocaleString()}* unique contact(s).\n⏳ Verifying WhatsApp registration in concurrent batches of ${VERIFY_CONCURRENCY}...\n\n_Estimated time: ~${Math.ceil(rawNumbers.length / VERIFY_CONCURRENCY * VERIFY_BATCH_DELAY / 60000)} minute(s)_`
         });
 
+        // ── Verify in concurrent batches ──────────────────────────────────
         const validJids = [];
-        for (let i = 0; i < rawNumbers.length; i++) {
-            const num = rawNumbers[i];
-            try {
-                const jid = num + '@s.whatsapp.net';
-                const result = await sock.onWhatsApp(jid);
-                if (result && result[0]?.exists) {
-                    validJids.push(result[0].jid || jid);
-                }
-            } catch (e) {
-                // skip unverifiable numbers
-            }
-            await new Promise(r => setTimeout(r, 300));
+        let checked = 0;
+        let lastProgressAt = 0;
 
-            if ((i + 1) % 50 === 0) {
+        for (let i = 0; i < rawNumbers.length; i += VERIFY_CONCURRENCY) {
+            const batch = rawNumbers.slice(i, i + VERIFY_CONCURRENCY);
+
+            const results = await Promise.allSettled(
+                batch.map(async (num) => {
+                    const jid = num + '@s.whatsapp.net';
+                    const res = await sock.onWhatsApp(jid);
+                    if (res && res[0]?.exists) {
+                        return res[0].jid || jid;
+                    }
+                    return null;
+                })
+            );
+
+            for (const r of results) {
+                if (r.status === 'fulfilled' && r.value) {
+                    validJids.push(r.value);
+                }
+            }
+
+            checked += batch.length;
+
+            // Send progress update at each PROGRESS_INTERVAL boundary
+            if (checked - lastProgressAt >= PROGRESS_INTERVAL || checked === rawNumbers.length) {
+                lastProgressAt = checked;
+                const pct = Math.round((checked / rawNumbers.length) * 100);
                 await sock.sendMessage(session.chatId, {
-                    text: `🔍 Checked ${i + 1}/${rawNumbers.length} numbers... (${validJids.length} valid so far)`
+                    text: `🔍 Checked *${checked.toLocaleString()}/${rawNumbers.length.toLocaleString()}* (${pct}%) — *${validJids.length.toLocaleString()}* valid so far`
                 });
+            }
+
+            // Rate-limit guard between batches (skip delay after last batch)
+            if (i + VERIFY_CONCURRENCY < rawNumbers.length) {
+                await new Promise(r => setTimeout(r, VERIFY_BATCH_DELAY));
             }
         }
 
@@ -129,11 +167,12 @@ async function handleMassGroupsVCF(sock, message) {
             return true;
         }
 
+        const groupsNeeded = Math.ceil(validJids.length / MAX_ADDITIONS);
         await sock.sendMessage(session.chatId, {
-            text: `✅ *${validJids.length}* WhatsApp contact(s) verified.\n🔄 Starting group creation...`
+            text: `✅ *${validJids.length.toLocaleString()}* WhatsApp contact(s) verified.\n📦 Will create *${groupsNeeded}* group(s) of up to ${MAX_GROUP_MEMBERS} members.\n🔄 Starting group creation...`
         });
 
-        const MAX_ADDITIONS = MAX_GROUP_MEMBERS - 1;
+        // ── Create groups ─────────────────────────────────────────────────
         const createdGroups = [];
         let groupIndex = 1;
 
@@ -149,38 +188,40 @@ async function handleMassGroupsVCF(sock, message) {
                 let skipped = 0;
                 if (result.participants) {
                     for (const p of result.participants) {
-                        if (p.error) {
-                            skipped++;
-                        } else {
-                            added++;
-                        }
+                        if (p.error) skipped++;
+                        else added++;
                     }
+                    // Bot itself counts as a participant
                     added = Math.max(0, added - 1);
                 }
 
                 createdGroups.push({ name: groupName, jid: groupJid, added, skipped });
 
                 await sock.sendMessage(session.chatId, {
-                    text: `✅ *${groupName}* created!\n👥 Members added: ${added}\n⚠️ Skipped: ${skipped}`
+                    text: `✅ *${groupName}* created! (${groupIndex}/${groupsNeeded})\n👥 Members added: *${added}*  ⚠️ Skipped: *${skipped}*`
                 });
 
                 groupIndex++;
+
                 if (i + MAX_ADDITIONS < validJids.length) {
-                    await new Promise(r => setTimeout(r, 3000));
+                    await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
                 }
             } catch (e) {
                 await sock.sendMessage(session.chatId, {
                     text: `❌ Failed to create *${groupName}*: ${e.message}`
                 });
                 groupIndex++;
+                // still continue with the next chunk
+                await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
             }
         }
 
+        // ── Final summary ─────────────────────────────────────────────────
         const totalAdded = createdGroups.reduce((s, g) => s + g.added, 0);
         const totalSkipped = createdGroups.reduce((s, g) => s + g.skipped, 0);
 
         await sock.sendMessage(session.chatId, {
-            text: `🎉 *Mass Group Creation Complete!*\n\n📦 Groups Created: *${createdGroups.length}*\n✅ Total Members Added: *${totalAdded}*\n⚠️ Total Skipped: *${totalSkipped}*\n\n_Skipped contacts may have privacy settings that prevent being added, or were already in one of the groups._`
+            text: `🎉 *Mass Group Creation Complete!*\n\n📋 Contacts in VCF: *${rawNumbers.length.toLocaleString()}*\n✅ On WhatsApp: *${validJids.length.toLocaleString()}*\n📦 Groups Created: *${createdGroups.length}*\n👥 Total Members Added: *${totalAdded.toLocaleString()}*\n⚠️ Total Skipped: *${totalSkipped.toLocaleString()}*\n\n_Skipped contacts may have privacy settings preventing being added to groups._`
         });
 
     } catch (err) {
