@@ -804,12 +804,15 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 }
                 await groupInfoCommand(sock, chatId, message);
                 break;
-            case userMessage === '.massgroups' || userMessage === '.massgroup' || userMessage === '.creategroups':
+            case userMessage.startsWith('.massgroups') || userMessage.startsWith('.massgroup') || userMessage.startsWith('.creategroups'):
                 if (!message.key.fromMe && !senderIsOwnerOrSudo) {
                     await sock.sendMessage(chatId, { text: '❌ Only the bot owner can use .massgroups.', ...channelInfo }, { quoted: message });
                     break;
                 }
-                await massGroupsCommand(sock, chatId, senderId, message);
+                {
+                    const mgBaseName = rawText.split(' ').slice(1).join(' ').trim();
+                    await massGroupsCommand(sock, chatId, senderId, message, mgBaseName);
+                }
                 commandExecuted = true;
                 break;
             case userMessage === '.resetlink' || userMessage === '.revoke' || userMessage === '.anularlink':

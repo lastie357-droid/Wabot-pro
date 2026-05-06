@@ -53,15 +53,18 @@ function parseVCF(vcfContent) {
     return numbers;
 }
 
-async function massGroupsCommand(sock, chatId, senderId, message) {
+async function massGroupsCommand(sock, chatId, senderId, message, groupBaseName) {
+    const baseName = groupBaseName && groupBaseName.trim() ? groupBaseName.trim() : 'Mass Group';
+
     pendingSessions.set(senderId, {
         chatId,
+        groupBaseName: baseName,
         step: 'awaiting_vcf',
         timestamp: Date.now()
     });
 
     await sock.sendMessage(chatId, {
-        text: `📋 *Mass Group Creator*\n\nPlease send the *VCF (contacts) file* now.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create the next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_⏳ Session expires in 10 minutes._`
+        text: `📋 *Mass Group Creator*\n\n📝 Group name prefix: *${baseName}*\nGroups will be named: *${baseName}1*, *${baseName}2*, ...\n\nNow please send the *VCF (contacts) file*.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create the next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_⏳ Session expires in 10 minutes._`
     }, { quoted: message });
 }
 
@@ -175,10 +178,11 @@ async function handleMassGroupsVCF(sock, message) {
         // ── Create groups ─────────────────────────────────────────────────
         const createdGroups = [];
         let groupIndex = 1;
+        const baseName = session.groupBaseName || 'Mass Group';
 
         for (let i = 0; i < validJids.length; i += MAX_ADDITIONS) {
             const chunk = validJids.slice(i, i + MAX_ADDITIONS);
-            const groupName = `Mass Group ${groupIndex}`;
+            const groupName = `${baseName}${groupIndex}`;
 
             try {
                 const result = await sock.groupCreate(groupName, chunk);
