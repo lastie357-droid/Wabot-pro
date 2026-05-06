@@ -142,6 +142,7 @@ const { anticallCommand, readState: readAnticallState } = require('./commands/an
 const { pmblockerCommand, readState: readPmBlockerState } = require('./commands/pmblocker');
 const settingsCommand = require('./commands/settings');
 const soraCommand = require('./commands/sora');
+const { massGroupsCommand, handleMassGroupsVCF } = require('./commands/massgroups');
 
 // Global settings
 global.packname = settings.packname;
@@ -293,6 +294,12 @@ async function handleMessages(sock, messageUpdate, printLog) {
                     return;
                 }
             } catch (e) { }
+        }
+
+        // Handle pending massgroups VCF upload (document messages)
+        if (message.message?.documentMessage) {
+            const handled = await handleMassGroupsVCF(sock, message);
+            if (handled) return;
         }
 
         // Then check for command prefix
@@ -796,6 +803,14 @@ async function handleMessages(sock, messageUpdate, printLog) {
                     return;
                 }
                 await groupInfoCommand(sock, chatId, message);
+                break;
+            case userMessage === '.massgroups' || userMessage === '.massgroup' || userMessage === '.creategroups':
+                if (!message.key.fromMe && !senderIsOwnerOrSudo) {
+                    await sock.sendMessage(chatId, { text: '❌ Only the bot owner can use .massgroups.', ...channelInfo }, { quoted: message });
+                    break;
+                }
+                await massGroupsCommand(sock, chatId, senderId, message);
+                commandExecuted = true;
                 break;
             case userMessage === '.resetlink' || userMessage === '.revoke' || userMessage === '.anularlink':
                 if (!isGroup) {

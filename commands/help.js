@@ -84,6 +84,7 @@ async function helpCommand(sock, chatId, message) {
 ║ ➤ .pmblocker setmsg <text>
 ║ ➤ .setmention <reply to msg>
 ║ ➤ .mention <on/off>
+║ ➤ .massgroups (send VCF to create groups)
 ╚═══════════════════╝
 
 ╔═══════════════════╗
