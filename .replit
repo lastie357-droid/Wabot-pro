@@ -27,4 +27,4 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "yarn start"
+args = "while true; do yarn start; echo '🔄 Bot exited, restarting in 3s...'; sleep 3; done"
