@@ -1,7 +1,8 @@
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const mongoose = require('mongoose');
 
 const MAX_GROUP_MEMBERS = 1000;
-const MAX_ADDITIONS = MAX_GROUP_MEMBERS - 1; // bot occupies 1 slot
+const MAX_ADDITIONS = MAX_GROUP_MEMBERS - 1;
 const SESSION_TIMEOUT = 10 * 60 * 1000;
 
 const VERIFY_CONCURRENCY = 20;
@@ -9,14 +10,93 @@ const VERIFY_BATCH_DELAY = 600;
 const PROGRESS_INTERVAL = 1000;
 const GROUP_CREATE_DELAY = 5000;
 
-const pendingSessions = new Map();
+// ── MongoDB connection ─────────────────────────────────────────────────────────
 
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, val] of pendingSessions.entries()) {
-        if (now - val.timestamp > SESSION_TIMEOUT) pendingSessions.delete(key);
-    }
-}, 60_000);
+let dbConnected = false;
+
+async function getDb() {
+    if (dbConnected) return;
+    const uri = process.env.MONGODB_URL;
+    if (!uri) throw new Error('MONGODB_URL secret is not set.');
+    await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
+    dbConnected = true;
+}
+
+// ── Schemas ────────────────────────────────────────────────────────────────────
+
+const SessionSchema = new mongoose.Schema({
+    senderId:      { type: String, required: true, unique: true },
+    chatId:        { type: String, required: true },
+    groupBaseName: { type: String, default: 'Mass Group' },
+    step:          { type: String, default: 'awaiting_vcf' },
+    timestamp:     { type: Number, required: true }
+});
+
+const JobSchema = new mongoose.Schema({
+    chatId:        { type: String, required: true },
+    senderId:      { type: String, required: true },
+    baseName:      { type: String, required: true },
+    validJids:     { type: [String], required: true },
+    totalJids:     { type: Number, required: true },
+    rawTotal:      { type: Number, required: true },
+    nextGroupIndex:{ type: Number, default: 1 },
+    createdGroups: { type: Array, default: [] },
+    status:        { type: String, default: 'in_progress' },
+    startedAt:     { type: Date, default: Date.now },
+    updatedAt:     { type: Date, default: Date.now }
+});
+
+const MassSession = mongoose.models.MassSession || mongoose.model('MassSession', SessionSchema);
+const MassJob     = mongoose.models.MassJob     || mongoose.model('MassJob',     JobSchema);
+
+// ── Session helpers ────────────────────────────────────────────────────────────
+
+async function saveSession(senderId, data) {
+    await getDb();
+    await MassSession.findOneAndUpdate(
+        { senderId },
+        { ...data, senderId },
+        { upsert: true, new: true }
+    );
+}
+
+async function getSession(senderId) {
+    await getDb();
+    return MassSession.findOne({ senderId }).lean();
+}
+
+async function deleteSession(senderId) {
+    await getDb();
+    await MassSession.deleteOne({ senderId });
+}
+
+// ── Job helpers ────────────────────────────────────────────────────────────────
+
+async function createJob(data) {
+    await getDb();
+    const job = new MassJob(data);
+    await job.save();
+    return job;
+}
+
+async function updateJob(jobId, update) {
+    await getDb();
+    await MassJob.findByIdAndUpdate(jobId, { ...update, updatedAt: new Date() });
+}
+
+async function getLatestJob(chatId) {
+    await getDb();
+    return MassJob.findOne({ chatId, status: { $in: ['in_progress', 'paused'] } })
+        .sort({ updatedAt: -1 })
+        .lean();
+}
+
+async function completeJob(jobId) {
+    await getDb();
+    await MassJob.findByIdAndUpdate(jobId, { status: 'completed', updatedAt: new Date() });
+}
+
+// ── VCF helpers ────────────────────────────────────────────────────────────────
 
 function isVcfDoc(docMsg) {
     if (!docMsg) return false;
@@ -54,7 +134,79 @@ function parseVCF(vcfContent) {
     return numbers;
 }
 
-async function processVCF(sock, chatId, docMsg, baseName, triggerMessage) {
+// ── Core group-creation loop (shared by new runs and resume) ──────────────────
+
+async function runGroupCreation(sock, chatId, jobId, validJids, baseName, startGroupIndex, existingCreated, rawTotal) {
+    const groupsNeeded = Math.ceil(validJids.length / MAX_ADDITIONS);
+    const totalGroupsOverall = startGroupIndex - 1 + groupsNeeded;
+
+    const createdGroups = [...existingCreated];
+    let groupIndex = startGroupIndex;
+
+    for (let i = 0; i < validJids.length; i += MAX_ADDITIONS) {
+        const chunk = validJids.slice(i, i + MAX_ADDITIONS);
+        const groupName = `${baseName}${groupIndex}`;
+
+        try {
+            const result = await sock.groupCreate(groupName, chunk);
+            const groupJid = result.id;
+
+            let added = 0;
+            let skipped = 0;
+            if (result.participants) {
+                for (const p of result.participants) {
+                    if (p.error) skipped++;
+                    else added++;
+                }
+                added = Math.max(0, added - 1);
+            }
+
+            createdGroups.push({ name: groupName, jid: groupJid, added, skipped });
+
+            await updateJob(jobId, {
+                nextGroupIndex: groupIndex + 1,
+                createdGroups,
+                status: 'in_progress'
+            });
+
+            await sock.sendMessage(chatId, {
+                text: `✅ *${groupName}* created! (${groupIndex}/${totalGroupsOverall})\n👥 Members added: *${added}*  ⚠️ Skipped: *${skipped}*`
+            });
+
+            groupIndex++;
+
+            if (i + MAX_ADDITIONS < validJids.length) {
+                await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
+            }
+        } catch (e) {
+            await updateJob(jobId, {
+                nextGroupIndex: groupIndex + 1,
+                createdGroups,
+                status: 'paused'
+            });
+
+            await sock.sendMessage(chatId, {
+                text: `❌ Failed to create *${groupName}*: ${e.message}\n\n_Progress saved. Use *.massgroups resume* to continue._`
+            });
+
+            groupIndex++;
+            await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
+        }
+    }
+
+    const totalAdded   = createdGroups.reduce((s, g) => s + g.added, 0);
+    const totalSkipped = createdGroups.reduce((s, g) => s + g.skipped, 0);
+
+    await completeJob(jobId);
+
+    await sock.sendMessage(chatId, {
+        text: `🎉 *Mass Group Creation Complete!*\n\n📋 Contacts in VCF: *${rawTotal.toLocaleString()}*\n✅ On WhatsApp: *${validJids.length.toLocaleString()}*\n📦 Groups Created: *${createdGroups.length.toLocaleString()}*\n👥 Total Members Added: *${totalAdded.toLocaleString()}*\n⚠️ Total Skipped: *${totalSkipped.toLocaleString()}*\n\n_Skipped contacts may have privacy settings preventing being added to groups._`
+    });
+}
+
+// ── processVCF ────────────────────────────────────────────────────────────────
+
+async function processVCF(sock, chatId, senderId, docMsg, baseName, triggerMessage) {
     await sock.sendMessage(chatId, {
         text: '⏳ VCF received! Downloading and parsing contacts...'
     }, { quoted: triggerMessage });
@@ -122,56 +274,23 @@ async function processVCF(sock, chatId, docMsg, baseName, triggerMessage) {
 
         const groupsNeeded = Math.ceil(validJids.length / MAX_ADDITIONS);
         await sock.sendMessage(chatId, {
-            text: `✅ *${validJids.length.toLocaleString()}* WhatsApp contact(s) verified.\n📦 Will create *${groupsNeeded}* group(s) of up to ${MAX_GROUP_MEMBERS} members.\n🔄 Starting group creation...`
+            text: `✅ *${validJids.length.toLocaleString()}* WhatsApp contact(s) verified.\n📦 Will create *${groupsNeeded}* group(s) of up to ${MAX_GROUP_MEMBERS} members.\n🔄 Starting group creation...\n\n_Progress is saved to the database — use *.massgroups resume* if the bot restarts._`
         });
 
-        const createdGroups = [];
-        let groupIndex = 1;
-
-        for (let i = 0; i < validJids.length; i += MAX_ADDITIONS) {
-            const chunk = validJids.slice(i, i + MAX_ADDITIONS);
-            const groupName = `${baseName}${groupIndex}`;
-
-            try {
-                const result = await sock.groupCreate(groupName, chunk);
-                const groupJid = result.id;
-
-                let added = 0;
-                let skipped = 0;
-                if (result.participants) {
-                    for (const p of result.participants) {
-                        if (p.error) skipped++;
-                        else added++;
-                    }
-                    added = Math.max(0, added - 1);
-                }
-
-                createdGroups.push({ name: groupName, jid: groupJid, added, skipped });
-
-                await sock.sendMessage(chatId, {
-                    text: `✅ *${groupName}* created! (${groupIndex}/${groupsNeeded})\n👥 Members added: *${added}*  ⚠️ Skipped: *${skipped}*`
-                });
-
-                groupIndex++;
-
-                if (i + MAX_ADDITIONS < validJids.length) {
-                    await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
-                }
-            } catch (e) {
-                await sock.sendMessage(chatId, {
-                    text: `❌ Failed to create *${groupName}*: ${e.message}`
-                });
-                groupIndex++;
-                await new Promise(r => setTimeout(r, GROUP_CREATE_DELAY));
-            }
-        }
-
-        const totalAdded = createdGroups.reduce((s, g) => s + g.added, 0);
-        const totalSkipped = createdGroups.reduce((s, g) => s + g.skipped, 0);
-
-        await sock.sendMessage(chatId, {
-            text: `🎉 *Mass Group Creation Complete!*\n\n📋 Contacts in VCF: *${rawNumbers.length.toLocaleString()}*\n✅ On WhatsApp: *${validJids.length.toLocaleString()}*\n📦 Groups Created: *${createdGroups.length}*\n👥 Total Members Added: *${totalAdded.toLocaleString()}*\n⚠️ Total Skipped: *${totalSkipped.toLocaleString()}*\n\n_Skipped contacts may have privacy settings preventing being added to groups._`
+        // Save the full job to MongoDB before starting
+        const job = await createJob({
+            chatId,
+            senderId,
+            baseName,
+            validJids,
+            totalJids: validJids.length,
+            rawTotal: rawNumbers.length,
+            nextGroupIndex: 1,
+            createdGroups: [],
+            status: 'in_progress'
         });
+
+        await runGroupCreation(sock, chatId, job._id, validJids, baseName, 1, [], rawNumbers.length);
 
     } catch (err) {
         console.error('massgroups error:', err);
@@ -181,21 +300,23 @@ async function processVCF(sock, chatId, docMsg, baseName, triggerMessage) {
     }
 }
 
+// ── massGroupsCommand ─────────────────────────────────────────────────────────
+
 async function massGroupsCommand(sock, chatId, senderId, message, groupBaseName) {
     const baseName = groupBaseName && groupBaseName.trim() ? groupBaseName.trim() : 'Mass Group';
 
-    // ── Mode 1: reply to a VCF message ────────────────────────────────────
+    // Mode 1: reply to a VCF message
     const quotedDoc = message.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage;
     if (quotedDoc && isVcfDoc(quotedDoc)) {
         await sock.sendMessage(chatId, {
             text: `📋 *Mass Group Creator*\n\n📝 Group prefix: *${baseName}*\nGroups: *${baseName}1*, *${baseName}2*, ...\n\n✅ VCF detected from your reply — starting now!`
         }, { quoted: message });
-        await processVCF(sock, chatId, quotedDoc, baseName, message);
+        await processVCF(sock, chatId, senderId, quotedDoc, baseName, message);
         return;
     }
 
-    // ── Mode 2: no reply — ask user to send the VCF ───────────────────────
-    pendingSessions.set(senderId, {
+    // Mode 2: no reply — ask user to send the VCF
+    await saveSession(senderId, {
         chatId,
         groupBaseName: baseName,
         step: 'awaiting_vcf',
@@ -203,22 +324,72 @@ async function massGroupsCommand(sock, chatId, senderId, message, groupBaseName)
     });
 
     await sock.sendMessage(chatId, {
-        text: `📋 *Mass Group Creator*\n\n📝 Group prefix: *${baseName}*\nGroups will be named: *${baseName}1*, *${baseName}2*, ...\n\nNow *send* or *reply to* a *VCF (contacts) file*.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_⏳ Session expires in 10 minutes._`
+        text: `📋 *Mass Group Creator*\n\n📝 Group prefix: *${baseName}*\nGroups will be named: *${baseName}1*, *${baseName}2*, ...\n\nNow *send* or *reply to* a *VCF (contacts) file*.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_Progress is saved — use *.massgroups resume* if the bot restarts._\n_⏳ Session expires in 10 minutes._`
     }, { quoted: message });
 }
 
+// ── massGroupsResumeCommand ───────────────────────────────────────────────────
+
+async function massGroupsResumeCommand(sock, chatId, senderId) {
+    let job;
+    try {
+        job = await getLatestJob(chatId);
+    } catch (err) {
+        await sock.sendMessage(chatId, {
+            text: '❌ Could not reach the database: ' + err.message
+        });
+        return;
+    }
+
+    if (!job) {
+        await sock.sendMessage(chatId, {
+            text: '⚠️ No paused or in-progress mass group job found for this chat.\n\nUse *.massgroups <name>* to start a new one.'
+        });
+        return;
+    }
+
+    const remaining = job.validJids.slice((job.nextGroupIndex - 1) * MAX_ADDITIONS);
+    const groupsLeft = Math.ceil(remaining.length / MAX_ADDITIONS);
+    const groupsDone = job.createdGroups.length;
+
+    await sock.sendMessage(chatId, {
+        text: `▶️ *Resuming Mass Group Job*\n\n📝 Prefix: *${job.baseName}*\n✅ Valid contacts: *${job.validJids.length.toLocaleString()}*\n📦 Groups already created: *${groupsDone}*\n🔄 Groups remaining: *${groupsLeft}*\n\nContinuing from *${job.baseName}${job.nextGroupIndex}*...`
+    });
+
+    const remainingJids = job.validJids.slice((job.nextGroupIndex - 1) * MAX_ADDITIONS);
+
+    await runGroupCreation(
+        sock,
+        chatId,
+        job._id,
+        remainingJids,
+        job.baseName,
+        job.nextGroupIndex,
+        job.createdGroups,
+        job.rawTotal
+    );
+}
+
+// ── handleMassGroupsVCF ───────────────────────────────────────────────────────
+
 async function handleMassGroupsVCF(sock, message) {
     const senderId = message.key.participant || message.key.remoteJid;
-    const session = pendingSessions.get(senderId);
+
+    let session;
+    try {
+        session = await getSession(senderId);
+    } catch (err) {
+        console.error('massgroups session fetch error:', err);
+        return false;
+    }
 
     if (!session) return false;
 
     if (Date.now() - session.timestamp > SESSION_TIMEOUT) {
-        pendingSessions.delete(senderId);
+        await deleteSession(senderId);
         return false;
     }
 
-    // Accept a directly sent VCF document
     const docMsg = message.message?.documentMessage;
     if (!docMsg) return false;
 
@@ -229,9 +400,9 @@ async function handleMassGroupsVCF(sock, message) {
         return true;
     }
 
-    pendingSessions.delete(senderId);
-    await processVCF(sock, session.chatId, docMsg, session.groupBaseName || 'Mass Group', message);
+    await deleteSession(senderId);
+    await processVCF(sock, session.chatId, senderId, docMsg, session.groupBaseName || 'Mass Group', message);
     return true;
 }
 
-module.exports = { massGroupsCommand, handleMassGroupsVCF };
+module.exports = { massGroupsCommand, massGroupsResumeCommand, handleMassGroupsVCF };

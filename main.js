@@ -142,7 +142,7 @@ const { anticallCommand, readState: readAnticallState } = require('./commands/an
 const { pmblockerCommand, readState: readPmBlockerState } = require('./commands/pmblocker');
 const settingsCommand = require('./commands/settings');
 const soraCommand = require('./commands/sora');
-const { massGroupsCommand, handleMassGroupsVCF } = require('./commands/massgroups');
+const { massGroupsCommand, massGroupsResumeCommand, handleMassGroupsVCF } = require('./commands/massgroups');
 
 // Global settings
 global.packname = settings.packname;
@@ -810,8 +810,13 @@ async function handleMessages(sock, messageUpdate, printLog) {
                     break;
                 }
                 {
-                    const mgBaseName = rawText.split(' ').slice(1).join(' ').trim();
-                    await massGroupsCommand(sock, chatId, senderId, message, mgBaseName);
+                    const mgArgs = rawText.split(' ').slice(1);
+                    if (mgArgs[0] && mgArgs[0].toLowerCase() === 'resume') {
+                        await massGroupsResumeCommand(sock, chatId, senderId);
+                    } else {
+                        const mgBaseName = mgArgs.join(' ').trim();
+                        await massGroupsCommand(sock, chatId, senderId, message, mgBaseName);
+                    }
                 }
                 commandExecuted = true;
                 break;
