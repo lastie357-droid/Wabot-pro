@@ -99,10 +99,31 @@ async function startXeonBotInc() {
         const { state, saveCreds } = await useMultiFileAuthState(`./session`)
         const msgRetryCounterCache = new NodeCache()
 
+        // Collect phone number BEFORE creating the socket so it is ready when qr fires
+        let pairingPhoneNumber = null
+        if (!state.creds.registered) {
+            if (global.phoneNumber) {
+                pairingPhoneNumber = String(global.phoneNumber).replace(/[^0-9]/g, '')
+            } else {
+                setStatus('waiting_for_number')
+                console.log(chalk.cyan('🌐 Open the web UI in your browser and enter your WhatsApp number to get a pairing code.'))
+                pairingPhoneNumber = (await waitForPhoneNumber()).replace(/[^0-9]/g, '')
+            }
+            const pn = require('awesome-phonenumber')
+            if (!pn('+' + pairingPhoneNumber).isValid()) {
+                const errMsg = 'Invalid phone number. Use full international format without + or spaces (e.g. 14155552671).'
+                console.log(chalk.red(errMsg))
+                setStatus('error', { error: errMsg })
+                await delay(3000)
+                return startXeonBotInc()
+            }
+            setStatus('requesting_code')
+        }
+
         const XeonBotInc = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: !pairingCode,
+            printQRInTerminal: false,
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             auth: {
                 creds: state.creds,
@@ -214,53 +235,23 @@ async function startXeonBotInc() {
 
     XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
 
-    // Handle pairing code
-    if (pairingCode && !XeonBotInc.authState.creds.registered) {
-        if (useMobile) throw new Error('Cannot use pairing code with mobile api')
-
-        let phoneNumber
-        if (!!global.phoneNumber) {
-            phoneNumber = global.phoneNumber
-        } else {
-            // No terminal available — wait for phone number from the web UI
-            setStatus('waiting_for_number')
-            console.log(chalk.cyan('🌐 Open the web UI in your browser and enter your WhatsApp number to get a pairing code.'))
-            phoneNumber = await waitForPhoneNumber()
-        }
-
-        // Clean the phone number - remove any non-digit characters
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
-
-        // Validate the phone number using awesome-phonenumber
-        const pn = require('awesome-phonenumber');
-        if (!pn('+' + phoneNumber).isValid()) {
-            const errMsg = 'Invalid phone number. Please enter your full international number (e.g., 15551234567) without + or spaces.'
-            console.log(chalk.red(errMsg))
-            setStatus('error', { error: errMsg })
-            process.exit(1);
-        }
-
-        setTimeout(async () => {
-            try {
-                let code = await XeonBotInc.requestPairingCode(phoneNumber)
-                code = code?.match(/.{1,4}/g)?.join("-") || code
-                console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
-                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
-                setStatus('waiting_for_pairing', { pairingCode: code })
-            } catch (error) {
-                console.error('Error requesting pairing code:', error)
-                console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
-                setStatus('error', { error: 'Failed to get pairing code: ' + error.message })
-            }
-        }, 3000)
-    }
-
     // Connection handling
     XeonBotInc.ev.on('connection.update', async (s) => {
         const { connection, lastDisconnect, qr } = s
-        
-        if (qr) {
-            console.log(chalk.yellow('📱 QR Code generated. Please scan with WhatsApp.'))
+
+        // qr firing means the WhatsApp server is ready for auth —
+        // request pairing code here instead of scanning the QR
+        if (qr && pairingPhoneNumber && !XeonBotInc.authState.creds.registered) {
+            try {
+                let code = await XeonBotInc.requestPairingCode(pairingPhoneNumber)
+                code = code?.match(/.{1,4}/g)?.join("-") || code
+                console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
+                console.log(chalk.yellow(`\nEnter this code in WhatsApp → Settings → Linked Devices → Link a Device`))
+                setStatus('waiting_for_pairing', { pairingCode: code })
+            } catch (error) {
+                console.error('Error requesting pairing code:', error)
+                setStatus('error', { error: 'Failed to get pairing code: ' + error.message })
+            }
         }
         
         if (connection === 'connecting') {
