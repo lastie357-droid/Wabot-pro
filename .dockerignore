@@ -1,0 +1,11 @@
+node_modules
+.git
+.github
+session
+*.log
+.env
+baileys_store.json
+temp
+tmp
+yarn.lock
+.local

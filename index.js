@@ -18,6 +18,7 @@ const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
 const PhoneNumber = require('awesome-phonenumber')
+const { startWebServer, waitForPhoneNumber, setStatus } = require('./webui')
 const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
 const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
 const {
@@ -221,7 +222,10 @@ async function startXeonBotInc() {
         if (!!global.phoneNumber) {
             phoneNumber = global.phoneNumber
         } else {
-            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 6281376552730 (without + or spaces) : `)))
+            // No terminal available — wait for phone number from the web UI
+            setStatus('waiting_for_number')
+            console.log(chalk.cyan('🌐 Open the web UI in your browser and enter your WhatsApp number to get a pairing code.'))
+            phoneNumber = await waitForPhoneNumber()
         }
 
         // Clean the phone number - remove any non-digit characters
@@ -230,7 +234,9 @@ async function startXeonBotInc() {
         // Validate the phone number using awesome-phonenumber
         const pn = require('awesome-phonenumber');
         if (!pn('+' + phoneNumber).isValid()) {
-            console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, etc.) without + or spaces.'));
+            const errMsg = 'Invalid phone number. Please enter your full international number (e.g., 15551234567) without + or spaces.'
+            console.log(chalk.red(errMsg))
+            setStatus('error', { error: errMsg })
             process.exit(1);
         }
 
@@ -240,9 +246,11 @@ async function startXeonBotInc() {
                 code = code?.match(/.{1,4}/g)?.join("-") || code
                 console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
                 console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
+                setStatus('waiting_for_pairing', { pairingCode: code })
             } catch (error) {
                 console.error('Error requesting pairing code:', error)
                 console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
+                setStatus('error', { error: 'Failed to get pairing code: ' + error.message })
             }
         }, 3000)
     }
@@ -260,6 +268,7 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
+            setStatus('connected')
             console.log(chalk.magenta(` `))
             console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
 
@@ -382,9 +391,14 @@ async function startXeonBotInc() {
 }
 
 
-// Start the bot with error handling
-startXeonBotInc().catch(error => {
-    console.error('Fatal error:', error)
+// Start web server first, then the bot
+startWebServer().then(() => {
+    startXeonBotInc().catch(error => {
+        console.error('Fatal error:', error)
+        process.exit(1)
+    })
+}).catch(error => {
+    console.error('Failed to start web server:', error)
     process.exit(1)
 })
 process.on('uncaughtException', (err) => {
