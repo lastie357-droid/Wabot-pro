@@ -80,20 +80,20 @@ global.themeemoji = "•"
 const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
 const useMobile = process.argv.includes("--mobile")
 
-// Only create readline interface if we're in an interactive environment
-const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
+// Use ownerNumber from settings automatically (non-interactive Replit environment)
+const rl = null
 const question = (text) => {
-    if (rl) {
-        return new Promise((resolve) => rl.question(text, resolve))
-    } else {
-        // In non-interactive environment, use ownerNumber from settings
-        return Promise.resolve(settings.ownerNumber || phoneNumber)
-    }
+    // Always use ownerNumber from settings in Replit environment
+    return Promise.resolve(settings.ownerNumber || phoneNumber)
 }
 
 
 async function startXeonBotInc() {
     try {
+        // Ensure session directory exists
+        if (!existsSync('./session')) {
+            fs.mkdirSync('./session', { recursive: true })
+        }
         let { version, isLatest } = await fetchLatestBaileysVersion()
         const { state, saveCreds } = await useMultiFileAuthState(`./session`)
         const msgRetryCounterCache = new NodeCache()
@@ -293,12 +293,12 @@ async function startXeonBotInc() {
         }
         
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
             const statusCode = lastDisconnect?.error?.output?.statusCode
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.forbidden
             
             console.log(chalk.red(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`))
             
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+            if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
                 try {
                     rmSync('./session', { recursive: true, force: true })
                     console.log(chalk.yellow('Session folder deleted. Please re-authenticate.'))
