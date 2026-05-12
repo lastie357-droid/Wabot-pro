@@ -140,8 +140,9 @@ It is lightweight and can be easily customized to add more commands as per your 
 
 ### Prerequisites
 
-- Node.js installed on your system
+- Node.js 20 or newer installed on your system
 - Git installed (for cloning the repository)
+- Docker installed if you want a containerized setup
 
 ### Step-by-Step Setup
 
@@ -155,7 +156,7 @@ It is lightweight and can be easily customized to add more commands as per your 
 2. **Install the dependencies:**
 
     ```bash
-    npm install
+    npm install --legacy-peer-deps
     ```
 
 3. **Run the bot:**
@@ -163,6 +164,13 @@ It is lightweight and can be easily customized to add more commands as per your 
     ```bash
     node index.js
     ```
+
+> If your machine does not have Node 20 available, use Docker instead:
+>
+> ```bash
+> npm run docker:build
+> npm run docker:run
+> ```
 
 4. **Scan the QR code:**
 

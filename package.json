@@ -12,7 +12,8 @@
     "start:fresh": "yarn reset-session && yarn start",
     "install:panel": "yarn install --legacy-peer-deps",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "docker:build": "docker build -t docker run -e SESSION_ID=$SESSION_ID knightbot"
+    "docker:build": "docker build -t wabot-pro .",
+    "docker:run": "docker run --rm -it -p 3000:3000 -v $(pwd)/session:/app/session -v $(pwd)/data:/app/data wabot-pro"
   },
   "keywords": [
     "whatsapp-bot"
@@ -77,6 +78,6 @@
     "jimp": "^1.6.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }
