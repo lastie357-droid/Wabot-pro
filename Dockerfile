@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:20-slim
 
 # Install system dependencies (Debian-based — glibc, so sharp pre-built binaries work)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     g++ \
     git \
+    openssh-client \
+    ca-certificates \
     wget \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -19,8 +21,10 @@ COPY package.json package-lock.json* yarn.lock* ./
 # Tell sharp to use its own bundled libvips (no system libvips needed)
 ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
 
-# Install production deps
-RUN npm install --legacy-peer-deps --omit=dev
+# Rewrite SSH GitHub URLs to HTTPS so npm install can fetch public git dependencies
+RUN git config --global url."https://github.com/".insteadOf git@github.com: \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && npm install --legacy-peer-deps --omit=dev
 
 # Copy the rest of the source
 COPY . .
