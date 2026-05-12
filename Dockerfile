@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy lockfiles first for better layer caching
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json* yarn.lock* ./
 
 # Tell sharp to use its own bundled libvips (no system libvips needed)
 ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
