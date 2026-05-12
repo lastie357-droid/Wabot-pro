@@ -1,22 +1,31 @@
-FROM node:18-alpine
+FROM node:18-slim
 
-RUN apk add --no-cache \
+# Install system dependencies (Debian-based — glibc, so sharp pre-built binaries work)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     python3 \
     make \
     g++ \
     git \
     wget \
-    curl
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package.json package-lock.json* yarn.lock* ./
+# Copy lockfiles first for better layer caching
+COPY package.json package-lock.json ./
 
+# Tell sharp to use its own bundled libvips (no system libvips needed)
+ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
+
+# Install production deps
 RUN npm install --legacy-peer-deps --omit=dev
 
+# Copy the rest of the source
 COPY . .
 
+# Ensure runtime directories exist
 RUN mkdir -p session temp tmp data
 
 EXPOSE 3000
