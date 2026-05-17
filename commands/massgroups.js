@@ -122,7 +122,11 @@ function parseVCF(vcfContent) {
         } else if (inVCard && /^TEL/i.test(trimmed)) {
             const match = trimmed.match(/TEL[^:]*:(.*)/i);
             if (match) {
-                const num = match[1].replace(/[^0-9]/g, '').trim();
+                let num = match[1].replace(/[^0-9]/g, '').trim();
+                // Auto-prefix country code 254 if number starts with 0 (e.g., 0704897825 -> 254704897825)
+                if (num.startsWith('0')) {
+                    num = '254' + num.substring(1);
+                }
                 if (num.length >= 7 && num.length <= 15 && !seen.has(num)) {
                     seen.add(num);
                     numbers.push(num);
@@ -227,7 +231,7 @@ async function processVCF(sock, chatId, senderId, docMsg, baseName, triggerMessa
         }
 
         await sock.sendMessage(chatId, {
-            text: `📊 Parsed *${rawNumbers.length.toLocaleString()}* unique contact(s).\n⏳ Verifying WhatsApp registration in batches of ${VERIFY_CONCURRENCY}...\n\n_Estimated time: ~${Math.ceil(rawNumbers.length / VERIFY_CONCURRENCY * VERIFY_BATCH_DELAY / 60000)} minute(s)_`
+            text: `📊 Parsed *${rawNumbers.length.toLocaleString()}* unique contact(s).\n🌍 Auto-prefixed country code 254 to numbers starting with 0.\n⏳ Verifying WhatsApp registration in batches of ${VERIFY_CONCURRENCY}...\n\n_Estimated time: ~${Math.ceil(rawNumbers.length / VERIFY_CONCURRENCY * VERIFY_BATCH_DELAY / 60000)} minute(s)_`
         });
 
         const validJids = [];
@@ -324,7 +328,7 @@ async function massGroupsCommand(sock, chatId, senderId, message, groupBaseName)
     });
 
     await sock.sendMessage(chatId, {
-        text: `📋 *Mass Group Creator*\n\n📝 Group prefix: *${baseName}*\nGroups will be named: *${baseName}1*, *${baseName}2*, ...\n\nNow *send* or *reply to* a *VCF (contacts) file*.\n\n_What I will do:_\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Discard numbers not on WhatsApp\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_Progress is saved — use *.massgroups resume* if the bot restarts._\n_⏳ Session expires in 10 minutes._`
+        text: `📋 *Mass Group Creator*\n\n📝 Group prefix: *${baseName}*\nGroups will be named: *${baseName}1*, *${baseName}2*, ...\n\nNow *send* or *reply to* a *VCF (contacts) file*.\n\n_What I will do:_\n• 🌍 Auto-prefix country code 254 to numbers starting with 0\n• ✅ Keep only numbers registered on WhatsApp\n• ❌ Auto-skip numbers not on WhatsApp or invalid\n• ⏭️ Skip contacts that fail to add\n• 👥 Create groups of up to ${MAX_GROUP_MEMBERS} members each\n• 🔄 Auto-create next group when limit is reached\n\n_Supports large contact lists (30 000+)._\n_Progress is saved — use *.massgroups resume* if the bot restarts._\n_⏳ Session expires in 10 minutes._`
     }, { quoted: message });
 }
 
