@@ -5,10 +5,11 @@ const MAX_GROUP_MEMBERS = 1000;
 const MAX_ADDITIONS = MAX_GROUP_MEMBERS - 1;
 const SESSION_TIMEOUT = 10 * 60 * 1000;
 
-const VERIFY_CONCURRENCY = 20;
-const VERIFY_BATCH_DELAY = 600;
+const VERIFY_CONCURRENCY = 5;         // Reduced from 20 to avoid rate-limit bans
+const VERIFY_BATCH_DELAY = 1500;      // Increased from 600ms to 1500ms (safer)
 const PROGRESS_INTERVAL = 1000;
-const GROUP_CREATE_DELAY = 5000;
+const GROUP_CREATE_DELAY = 10000;     // Increased from 5000ms to 10000ms (10s, safer)
+const BATCH_SIZE_FOR_GROUP = 254;     // Start group creation every 254 verified contacts
 
 // ── MongoDB connection ─────────────────────────────────────────────────────────
 
@@ -208,6 +209,108 @@ async function runGroupCreation(sock, chatId, jobId, validJids, baseName, startG
     });
 }
 
+// ── Concurrent verification & group creation ──────────────────────────────────
+
+async function processVCFConcurrent(sock, chatId, senderId, docMsg, baseName, triggerMessage, rawNumbers) {
+    const validJids = [];
+    let verificationComplete = false;
+    let checked = 0;
+    let lastProgressAt = 0;
+    let groupCreationStarted = false;
+    let jobId = null;
+
+    // Start verification process
+    const verifyPromise = (async () => {
+        for (let i = 0; i < rawNumbers.length; i += VERIFY_CONCURRENCY) {
+            const batch = rawNumbers.slice(i, i + VERIFY_CONCURRENCY);
+
+            const results = await Promise.allSettled(
+                batch.map(async (num) => {
+                    const jid = num + '@s.whatsapp.net';
+                    const res = await sock.onWhatsApp(jid);
+                    if (res && res[0]?.exists) return res[0].jid || jid;
+                    return null;
+                })
+            );
+
+            for (const r of results) {
+                if (r.status === 'fulfilled' && r.value) validJids.push(r.value);
+            }
+
+            checked += batch.length;
+
+            // Send progress update
+            if (checked - lastProgressAt >= PROGRESS_INTERVAL || checked === rawNumbers.length) {
+                lastProgressAt = checked;
+                const pct = Math.round((checked / rawNumbers.length) * 100);
+                await sock.sendMessage(chatId, {
+                    text: `🔍 Checked *${checked.toLocaleString()}/${rawNumbers.length.toLocaleString()}* (${pct}%) — *${validJids.length.toLocaleString()}* valid so far`
+                });
+            }
+
+            // **START GROUP CREATION once we have 254+ verified and haven't started yet**
+            if (validJids.length >= BATCH_SIZE_FOR_GROUP && !groupCreationStarted) {
+                groupCreationStarted = true;
+                const groupsNeeded = Math.ceil(rawNumbers.length / MAX_ADDITIONS);
+                await sock.sendMessage(chatId, {
+                    text: `✅ *${validJids.length.toLocaleString()}* contacts verified! 🚀 Starting group creation...\n📦 Will create ~*${groupsNeeded}* groups.\n\n_Verification continues in background..._`
+                });
+
+                // Create job and start group creation in background (don't await - let verification continue)
+                jobId = await initiateConcurrentGroupCreation(sock, chatId, senderId, baseName, validJids, rawNumbers.length);
+            }
+
+            if (i + VERIFY_CONCURRENCY < rawNumbers.length) {
+                await new Promise(r => setTimeout(r, VERIFY_BATCH_DELAY));
+            }
+        }
+
+        verificationComplete = true;
+    })();
+
+    // Wait for verification to complete
+    await verifyPromise;
+
+    if (validJids.length === 0) {
+        await sock.sendMessage(chatId, {
+            text: '❌ None of the contacts are registered on WhatsApp.'
+        });
+        return;
+    }
+
+    // If group creation wasn't started (< 254 contacts), start it now
+    if (!groupCreationStarted && validJids.length > 0) {
+        const groupsNeeded = Math.ceil(validJids.length / MAX_ADDITIONS);
+        await sock.sendMessage(chatId, {
+            text: `✅ All *${validJids.length.toLocaleString()}* verified contacts.\n📦 Creating *${groupsNeeded}* group(s)...`
+        });
+        jobId = await initiateConcurrentGroupCreation(sock, chatId, senderId, baseName, validJids, rawNumbers.length);
+    }
+}
+
+// ── Initialize concurrent group creation ───────────────────────────────────────
+
+async function initiateConcurrentGroupCreation(sock, chatId, senderId, baseName, validJids, rawTotal) {
+    const job = await createJob({
+        chatId,
+        senderId,
+        baseName,
+        validJids,
+        totalJids: validJids.length,
+        rawTotal,
+        nextGroupIndex: 1,
+        createdGroups: [],
+        status: 'in_progress'
+    });
+
+    // Run group creation in background (don't wait for it to complete)
+    runGroupCreation(sock, chatId, job._id, validJids, baseName, 1, [], rawTotal).catch(err => {
+        console.error('Group creation error:', err);
+    });
+
+    return job._id;
+}
+
 // ── processVCF ────────────────────────────────────────────────────────────────
 
 async function processVCF(sock, chatId, senderId, docMsg, baseName, triggerMessage) {
@@ -231,70 +334,11 @@ async function processVCF(sock, chatId, senderId, docMsg, baseName, triggerMessa
         }
 
         await sock.sendMessage(chatId, {
-            text: `📊 Parsed *${rawNumbers.length.toLocaleString()}* unique contact(s).\n🌍 Auto-prefixed country code 254 to numbers starting with 0.\n⏳ Verifying WhatsApp registration in batches of ${VERIFY_CONCURRENCY}...\n\n_Estimated time: ~${Math.ceil(rawNumbers.length / VERIFY_CONCURRENCY * VERIFY_BATCH_DELAY / 60000)} minute(s)_`
+            text: `📊 Parsed *${rawNumbers.length.toLocaleString()}* unique contact(s).\n🌍 Auto-prefixed country code 254 to numbers starting with 0.\n⏳ Verifying WhatsApp registration (starting group creation at 254 verified)...\n\n_Verification runs in parallel with group creation for speed!_`
         });
 
-        const validJids = [];
-        let checked = 0;
-        let lastProgressAt = 0;
-
-        for (let i = 0; i < rawNumbers.length; i += VERIFY_CONCURRENCY) {
-            const batch = rawNumbers.slice(i, i + VERIFY_CONCURRENCY);
-
-            const results = await Promise.allSettled(
-                batch.map(async (num) => {
-                    const jid = num + '@s.whatsapp.net';
-                    const res = await sock.onWhatsApp(jid);
-                    if (res && res[0]?.exists) return res[0].jid || jid;
-                    return null;
-                })
-            );
-
-            for (const r of results) {
-                if (r.status === 'fulfilled' && r.value) validJids.push(r.value);
-            }
-
-            checked += batch.length;
-
-            if (checked - lastProgressAt >= PROGRESS_INTERVAL || checked === rawNumbers.length) {
-                lastProgressAt = checked;
-                const pct = Math.round((checked / rawNumbers.length) * 100);
-                await sock.sendMessage(chatId, {
-                    text: `🔍 Checked *${checked.toLocaleString()}/${rawNumbers.length.toLocaleString()}* (${pct}%) — *${validJids.length.toLocaleString()}* valid so far`
-                });
-            }
-
-            if (i + VERIFY_CONCURRENCY < rawNumbers.length) {
-                await new Promise(r => setTimeout(r, VERIFY_BATCH_DELAY));
-            }
-        }
-
-        if (validJids.length === 0) {
-            await sock.sendMessage(chatId, {
-                text: '❌ None of the contacts are registered on WhatsApp.'
-            });
-            return;
-        }
-
-        const groupsNeeded = Math.ceil(validJids.length / MAX_ADDITIONS);
-        await sock.sendMessage(chatId, {
-            text: `✅ *${validJids.length.toLocaleString()}* WhatsApp contact(s) verified.\n📦 Will create *${groupsNeeded}* group(s) of up to ${MAX_GROUP_MEMBERS} members.\n🔄 Starting group creation...\n\n_Progress is saved to the database — use *.massgroups resume* if the bot restarts._`
-        });
-
-        // Save the full job to MongoDB before starting
-        const job = await createJob({
-            chatId,
-            senderId,
-            baseName,
-            validJids,
-            totalJids: validJids.length,
-            rawTotal: rawNumbers.length,
-            nextGroupIndex: 1,
-            createdGroups: [],
-            status: 'in_progress'
-        });
-
-        await runGroupCreation(sock, chatId, job._id, validJids, baseName, 1, [], rawNumbers.length);
+        // Use concurrent verification & group creation
+        await processVCFConcurrent(sock, chatId, senderId, docMsg, baseName, triggerMessage, rawNumbers);
 
     } catch (err) {
         console.error('massgroups error:', err);
