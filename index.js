@@ -9,6 +9,15 @@
  * - Baileys Library by @adiwajshing
  * - Pair Code implementation inspired by TechGod143 & DGXEON
  */
+for (const method of ['info', 'warn']) {
+    const original = console[method].bind(console);
+    console[method] = (...args) => {
+        const sessionLog = args[0] === 'Closing session:' || args[0] === 'Session already closed';
+        if (sessionLog && args[1] && typeof args[1] === 'object') return;
+        return original(...args);
+    };
+}
+
 require('./settings')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
@@ -354,12 +363,6 @@ async function startXeonBotInc() {
 
     XeonBotInc.ev.on('group-participants.update', async (update) => {
         await handleGroupParticipantUpdate(XeonBotInc, update);
-    });
-
-    XeonBotInc.ev.on('messages.upsert', async (m) => {
-        if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
-            await handleStatus(XeonBotInc, m);
-        }
     });
 
     XeonBotInc.ev.on('status.update', async (status) => {

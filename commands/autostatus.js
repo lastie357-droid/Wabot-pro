@@ -17,6 +17,17 @@ const channelInfo = {
 // Path to store auto status configuration
 const configPath = path.join(__dirname, '../data/autoStatus.json');
 
+function isSocketOpen(sock) {
+    if (typeof sock?.ws?.isOpen === 'boolean') return sock.ws.isOpen;
+    if (typeof sock?.ws?.readyState === 'number') return sock.ws.readyState === 1;
+    return true;
+}
+
+function isConnectionClosedError(error) {
+    return /connection closed|connection terminated|websocket.*(?:closed|not open)|socket.*(?:closed|not open)/i
+        .test(String(error?.message || error || ''));
+}
+
 // Initialize config file if it doesn't exist
 if (!fs.existsSync(configPath)) {
     fs.writeFileSync(configPath, JSON.stringify({ 
@@ -141,7 +152,7 @@ function isStatusReactionEnabled() {
 // Function to react to status using proper method
 async function reactToStatus(sock, statusKey) {
     try {
-        if (!isStatusReactionEnabled()) {
+        if (!isSocketOpen(sock) || !isStatusReactionEnabled()) {
             return;
         }
 
@@ -167,19 +178,22 @@ async function reactToStatus(sock, statusKey) {
         
         // Removed success log - only keep errors
     } catch (error) {
-        console.error('❌ Error reacting to status:', error.message);
+        if (!isConnectionClosedError(error)) {
+            console.error('❌ Error reacting to status:', error.message);
+        }
     }
 }
 
 // Function to handle status updates
 async function handleStatusUpdate(sock, status) {
     try {
-        if (!isAutoStatusEnabled()) {
+        if (!isSocketOpen(sock) || !isAutoStatusEnabled()) {
             return;
         }
 
         // Add delay to prevent rate limiting
         await new Promise(resolve => setTimeout(resolve, 1000));
+        if (!isSocketOpen(sock)) return;
 
         // Handle status from messages.upsert
         if (status.messages && status.messages.length > 0) {
@@ -197,6 +211,7 @@ async function handleStatusUpdate(sock, status) {
                     if (err.message?.includes('rate-overlimit')) {
                         console.log('⚠️ Rate limit hit, waiting before retrying...');
                         await new Promise(resolve => setTimeout(resolve, 2000));
+                        if (!isSocketOpen(sock)) return;
                         await sock.readMessages([msg.key]);
                     } else {
                         throw err;
@@ -220,6 +235,7 @@ async function handleStatusUpdate(sock, status) {
                 if (err.message?.includes('rate-overlimit')) {
                     console.log('⚠️ Rate limit hit, waiting before retrying...');
                     await new Promise(resolve => setTimeout(resolve, 2000));
+                    if (!isSocketOpen(sock)) return;
                     await sock.readMessages([status.key]);
                 } else {
                     throw err;
@@ -242,6 +258,7 @@ async function handleStatusUpdate(sock, status) {
                 if (err.message?.includes('rate-overlimit')) {
                     console.log('⚠️ Rate limit hit, waiting before retrying...');
                     await new Promise(resolve => setTimeout(resolve, 2000));
+                    if (!isSocketOpen(sock)) return;
                     await sock.readMessages([status.reaction.key]);
                 } else {
                     throw err;
@@ -251,7 +268,9 @@ async function handleStatusUpdate(sock, status) {
         }
 
     } catch (error) {
-        console.error('❌ Error in auto status view:', error.message);
+        if (!isConnectionClosedError(error)) {
+            console.error('❌ Error in auto status view:', error.message);
+        }
     }
 }
 

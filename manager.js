@@ -1,19 +1,32 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { fork } = require('child_process');
 const express = require('express');
 const mongoose = require('mongoose');
 const { createCloneWorkspace } = require('./lib/clone-workspace');
 const { resetBotWorkspace } = require('./lib/reset-bot-workspace');
+const { acquireSingleInstanceLock, releaseSingleInstanceLock } = require('./lib/single-instance-lock');
 
 const ROOT = __dirname;
+const MANAGER_LOCK_PATH = path.join(
+    os.tmpdir(),
+    `knightbot-manager-${crypto.createHash('sha256').update(ROOT).digest('hex')}.lock`
+);
 const PORT = Number(process.env.PORT || 5000);
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const SESSION_COOKIE = 'knight_admin_session';
 const instances = new Map();
 const loginAttempts = new Map();
 let shuttingDown = false;
+let managerLockFd = null;
+
+function releaseManagerLock() {
+    if (managerLockFd === null) return;
+    releaseSingleInstanceLock(MANAGER_LOCK_PATH, managerLockFd);
+    managerLockFd = null;
+}
 
 function requireConfiguration() {
     const required = ['ADMIN_USERNAME', 'ADMIN_PASSWORD', 'MONGODB_URL', 'SESSION_SECRET'];
@@ -442,7 +455,8 @@ function updateStoredStatus(id, status) {
 function startInstance(record) {
     if (shuttingDown) return;
     const id = record.id;
-    if (!id || instances.get(id)?.child?.connected) return;
+    const existingChild = instances.get(id)?.child;
+    if (!id || (existingChild && existingChild.exitCode === null)) return;
     let cwd = ROOT;
     if (id !== 'main') {
         try {
@@ -523,6 +537,7 @@ function startInstance(record) {
 }
 
 async function start() {
+    managerLockFd = await acquireSingleInstanceLock(MANAGER_LOCK_PATH);
     requireConfiguration();
     await mongoose.connect(process.env.MONGODB_URL, { serverSelectionTimeoutMS: 15000 });
     const sessions = sessionCollection();
@@ -568,9 +583,11 @@ async function shutdown() {
         }))
     ]);
     await mongoose.disconnect().catch(() => {});
+    releaseManagerLock();
     process.exit(0);
 }
 
+process.once('exit', releaseManagerLock);
 process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
 
