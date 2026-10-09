@@ -4,9 +4,9 @@ const path = require('path');
 const { fork } = require('child_process');
 const express = require('express');
 const mongoose = require('mongoose');
+const { createCloneWorkspace } = require('./lib/clone-workspace');
 
 const ROOT = __dirname;
-const WORKSPACE_ROOT = path.join(ROOT, '.bot-instances');
 const PORT = Number(process.env.PORT || 5000);
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const SESSION_COOKIE = 'knight_admin_session';
@@ -117,6 +117,8 @@ function requireAdmin(req, res, next) {
 function enforceSameOrigin(req, res, next) {
     const origin = req.get('origin');
     if (!origin) return next();
+    // Replit's proxy can rewrite the request host; browsers still classify same-origin fetches.
+    if (req.get('sec-fetch-site') === 'same-origin') return next();
 
     try {
         const requestOrigin = new URL(origin);
@@ -323,7 +325,7 @@ app.post('/api/instances', requireAdmin, async (_req, res) => {
         }, 0) + 1;
         const id = `clone-${String(nextNumber).padStart(4, '0')}`;
         const name = `Knight Bot ${nextNumber + 1}`;
-        createCloneWorkspace(id);
+        createCloneWorkspace(ROOT, id);
         const record = { _id: id, id, name, createdAt: new Date(), status: 'starting' };
         await instanceCollection().insertOne(record);
         startInstance(record);
@@ -411,7 +413,7 @@ async function finishPairingReset(entry, record) {
 }
 
 function clearPairingTemporaryFiles(id) {
-    const workspace = id === 'main' ? ROOT : createCloneWorkspace(id);
+    const workspace = id === 'main' ? ROOT : createCloneWorkspace(ROOT, id);
     const root = path.resolve(workspace);
     const files = [
         'session', 'temp', 'tmp', 'auth_info_baileys',
@@ -426,54 +428,6 @@ function clearPairingTemporaryFiles(id) {
             fs.mkdirSync(target, { recursive: true, mode: 0o700 });
         }
     }
-}
-
-function createCloneWorkspace(id) {
-    const instanceRoot = path.join(WORKSPACE_ROOT, id);
-    const workspace = path.join(instanceRoot, 'workspace');
-    if (!/^clone-\d{4,}$/.test(id)) throw new Error('Invalid instance identifier.');
-    fs.mkdirSync(instanceRoot, { recursive: true, mode: 0o700 });
-
-    if (!fs.existsSync(path.join(workspace, 'index.js'))) {
-        if (fs.existsSync(workspace)) fs.rmSync(workspace, { recursive: true, force: true });
-        fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
-        const excluded = new Set([
-            '.git', '.cache', '.local', '.agents', '.bot-instances',
-            'node_modules', 'session', 'tmp', 'temp', 'package-lock.json'
-        ]);
-        fs.cpSync(ROOT, workspace, {
-            recursive: true,
-            filter(source) {
-                const relative = path.relative(ROOT, source);
-                if (!relative || relative === '.') return true;
-                const parts = relative.split(path.sep);
-                if (parts.some((part) => excluded.has(part) || part === '.env')) return false;
-                if (relative === 'baileys_store.json') return false;
-                return true;
-            }
-        });
-
-        const seedData = path.join(workspace, 'data');
-        fs.mkdirSync(seedData, { recursive: true });
-        const freshData = {
-            'banned.json': [],
-            'messageCount.json': { isPublic: true, messageCount: {} },
-            'premium.json': [],
-            'warnings.json': {},
-            'userGroupData.json': {
-                users: [], groups: [], antilink: {}, antibadword: {}, warnings: {},
-                sudo: [], welcome: {}, goodbye: {}, chatbot: {}, autoReaction: false
-            }
-        };
-        for (const [file, contents] of Object.entries(freshData)) {
-            fs.writeFileSync(path.join(seedData, file), JSON.stringify(contents, null, 2));
-        }
-
-        const rootModules = path.join(ROOT, 'node_modules');
-        if (!fs.existsSync(rootModules)) throw new Error('Project dependencies are not installed.');
-        fs.symlinkSync(rootModules, path.join(workspace, 'node_modules'), 'dir');
-    }
-    return workspace;
 }
 
 function workerEnvironment(id) {
@@ -500,7 +454,7 @@ function startInstance(record) {
     let cwd = ROOT;
     if (id !== 'main') {
         try {
-            cwd = createCloneWorkspace(id);
+            cwd = createCloneWorkspace(ROOT, id);
         } catch (error) {
             instances.set(id, {
                 id, name: record.name,
@@ -516,6 +470,7 @@ function startInstance(record) {
         state: { status: 'starting', pairingCode: null, error: null }
     };
     entry.name = record.name || entry.name;
+    entry.record = record;
     entry.state = { status: 'starting', pairingCode: null, error: null };
     instances.set(id, entry);
 
