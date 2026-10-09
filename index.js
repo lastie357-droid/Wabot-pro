@@ -18,12 +18,12 @@ const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
 const PhoneNumber = require('awesome-phonenumber')
-const { startWebServer, waitForPhoneNumber, setStatus } = require('./webui')
+const { waitForPhoneNumber, setStatus } = require('./webui')
+const { useMongoAuthState, clearMongoAuthState } = require('./mongo-auth-state')
 const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
 const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     generateForwardMessageContent,
@@ -43,7 +43,6 @@ const pino = require("pino")
 const readline = require("readline")
 const { parsePhoneNumber } = require("libphonenumber-js")
 const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
-const { rmSync, existsSync } = require('fs')
 const { join } = require('path')
 
 // Import lightweight store
@@ -91,12 +90,10 @@ const question = (text) => {
 
 async function startXeonBotInc() {
     try {
-        // Ensure session directory exists
-        if (!existsSync('./session')) {
-            fs.mkdirSync('./session', { recursive: true })
-        }
+        setStatus('starting')
         let { version, isLatest } = await fetchLatestBaileysVersion()
-        const { state, saveCreds } = await useMultiFileAuthState(`./session`)
+        const instanceId = process.env.KNIGHT_BOT_INSTANCE_ID || 'main'
+        const { state, saveCreds } = await useMongoAuthState(instanceId)
         const msgRetryCounterCache = new NodeCache()
 
         // Collect phone number BEFORE creating the socket so it is ready when qr fires
@@ -300,8 +297,8 @@ async function startXeonBotInc() {
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
                 try {
-                    rmSync('./session', { recursive: true, force: true })
-                    console.log(chalk.yellow('Session folder deleted. Please re-authenticate.'))
+                    await clearMongoAuthState(instanceId)
+                    console.log(chalk.yellow('Saved WhatsApp session cleared. Please re-authenticate.'))
                 } catch (error) {
                     console.error('Error deleting session:', error)
                 }
@@ -376,20 +373,15 @@ async function startXeonBotInc() {
     return XeonBotInc
     } catch (error) {
         console.error('Error in startXeonBotInc:', error)
+        setStatus('error', { error: error.message })
         await delay(5000)
         startXeonBotInc()
     }
 }
 
 
-// Start web server first, then the bot
-startWebServer().then(() => {
-    startXeonBotInc().catch(error => {
-        console.error('Fatal error:', error)
-        process.exit(1)
-    })
-}).catch(error => {
-    console.error('Failed to start web server:', error)
+startXeonBotInc().catch(error => {
+    console.error('Fatal error:', error)
     process.exit(1)
 })
 process.on('uncaughtException', (err) => {
@@ -400,10 +392,3 @@ process.on('unhandledRejection', (err) => {
     console.error('Unhandled Rejection:', err)
 })
 
-let file = require.resolve(__filename)
-fs.watchFile(file, () => {
-    fs.unwatchFile(file)
-    console.log(chalk.redBright(`Update ${__filename}`))
-    delete require.cache[file]
-    require(file)
-})
