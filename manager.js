@@ -147,7 +147,12 @@ function enforceSameOrigin(req, res, next) {
             ...(process.env.REPLIT_DOMAINS || '').split(',')
         ].map((domain) => domain.trim()).filter(Boolean);
         for (const domain of configuredDomains) {
-            allowedOrigins.add(new URL(`https://${domain}`).origin);
+            const configuredOrigin = new URL(`https://${domain}`);
+            allowedOrigins.add(configuredOrigin.origin);
+            if (domain === process.env.REPLIT_DEV_DOMAIN && PORT > 0 && PORT < 65536) {
+                configuredOrigin.port = String(PORT);
+                allowedOrigins.add(configuredOrigin.origin);
+            }
         }
 
         if (!allowedOrigins.has(requestOrigin.origin)) {
