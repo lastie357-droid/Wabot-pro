@@ -1,4 +1,4 @@
-modules = ["nodejs-20", "nix"]
+modules = ["nodejs-20"]
 [agent]
 expertMode = true
 stack = "BEST_EFFORT_FALLBACK"
@@ -23,17 +23,12 @@ name = "Start application"
 author = "agent"
 
 [workflows.workflow.metadata]
-outputType = "webview"
+outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "node manager.js"
-waitForPort = 5000
+args = "while true; do npm start; echo '🔄 Bot exited, restarting in 3s...'; sleep 3; done"
 
 [[ports]]
-localPort = 5000
-externalPort = 5000
-
-[deployment]
-deploymentTarget = "vm"
-run = ["npm", "start"]
+localPort = 3000
+externalPort = 80

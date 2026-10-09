@@ -9,15 +9,6 @@
  * - Baileys Library by @adiwajshing
  * - Pair Code implementation inspired by TechGod143 & DGXEON
  */
-for (const method of ['info', 'warn']) {
-    const original = console[method].bind(console);
-    console[method] = (...args) => {
-        const sessionLog = args[0] === 'Closing session:' || args[0] === 'Session already closed';
-        if (sessionLog && args[1] && typeof args[1] === 'object') return;
-        return original(...args);
-    };
-}
-
 require('./settings')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
@@ -27,12 +18,12 @@ const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
 const PhoneNumber = require('awesome-phonenumber')
-const { waitForPhoneNumber, setStatus } = require('./webui')
-const { useMongoAuthState, clearMongoAuthState } = require('./mongo-auth-state')
+const { startWebServer, waitForPhoneNumber, setStatus } = require('./webui')
 const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
 const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
 const {
     default: makeWASocket,
+    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     generateForwardMessageContent,
@@ -52,6 +43,7 @@ const pino = require("pino")
 const readline = require("readline")
 const { parsePhoneNumber } = require("libphonenumber-js")
 const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
+const { rmSync, existsSync } = require('fs')
 const { join } = require('path')
 
 // Import lightweight store
@@ -61,8 +53,6 @@ const store = require('./lib/lightweight_store')
 store.readFromFile()
 const settings = require('./settings')
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000)
-let activeSocket = null
-let reconnectPending = false
 
 // Memory optimization - Force garbage collection if available
 setInterval(() => {
@@ -101,10 +91,12 @@ const question = (text) => {
 
 async function startXeonBotInc() {
     try {
-        setStatus('starting')
+        // Ensure session directory exists
+        if (!existsSync('./session')) {
+            fs.mkdirSync('./session', { recursive: true })
+        }
         let { version, isLatest } = await fetchLatestBaileysVersion()
-        const instanceId = process.env.KNIGHT_BOT_INSTANCE_ID || 'main'
-        const { state, saveCreds } = await useMongoAuthState(instanceId)
+        const { state, saveCreds } = await useMultiFileAuthState(`./session`)
         const msgRetryCounterCache = new NodeCache()
 
         // Collect phone number BEFORE creating the socket so it is ready when qr fires
@@ -114,7 +106,7 @@ async function startXeonBotInc() {
                 pairingPhoneNumber = String(global.phoneNumber).replace(/[^0-9]/g, '')
             } else {
                 setStatus('waiting_for_number')
-                console.log(chalk.cyan('🌐 Sign in to the private bot manager to link this WhatsApp account.'))
+                console.log(chalk.cyan('🌐 Open the web UI in your browser and enter your WhatsApp number to get a pairing code.'))
                 pairingPhoneNumber = (await waitForPhoneNumber()).replace(/[^0-9]/g, '')
             }
             const pn = require('awesome-phonenumber')
@@ -150,63 +142,43 @@ async function startXeonBotInc() {
             connectTimeoutMs: 260000,
             keepAliveIntervalMs: 90000,
         })
-        activeSocket = XeonBotInc
 
-        // Serialize credential writes so an older update cannot finish after a newer one.
-        let credentialsSaveQueue = Promise.resolve()
-        let credentialSaveError = null
-        XeonBotInc.ev.on('creds.update', () => {
-            credentialsSaveQueue = credentialsSaveQueue
-                .then(() => saveCreds())
-                .then(() => {
-                    const hadSaveError = credentialSaveError
-                    credentialSaveError = null
-                    if (hadSaveError && activeSocket === XeonBotInc && XeonBotInc.user) {
-                        setStatus('connected')
-                    }
-                })
-                .catch((error) => {
-                    credentialSaveError = error
-                    console.error('Could not save WhatsApp credentials to MongoDB:', error.message)
-                    setStatus('error', {
-                        error: 'WhatsApp connected, but its session could not be saved to MongoDB. It may not reconnect after a restart.'
-                    })
-                })
-            return credentialsSaveQueue
-        })
+        // Save credentials when they update
+        XeonBotInc.ev.on('creds.update', saveCreds)
 
     store.bind(XeonBotInc.ev)
 
     // Message handling
     XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
-        for (const mek of chatUpdate.messages || []) {
-            if (activeSocket !== XeonBotInc) return
+        try {
+            const mek = chatUpdate.messages[0]
+            if (!mek.message) return
+            mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
+            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
+                await handleStatus(XeonBotInc, chatUpdate);
+                return;
+            }
+            // In private mode, only block non-group messages (allow groups for moderation)
+            // Note: XeonBotInc.public is not synced, so we check mode in main.js instead
+            // This check is kept for backward compatibility but mainly blocks DMs
+            if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') {
+                const isGroup = mek.key?.remoteJid?.endsWith('@g.us')
+                if (!isGroup) return // Block DMs in private mode, but allow group messages
+            }
+            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
+
+            // Clear message retry cache to prevent memory bloat
+            if (XeonBotInc?.msgRetryCounterCache) {
+                XeonBotInc.msgRetryCounterCache.clear()
+            }
+
             try {
-                if (!mek?.message) continue
-                mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage')
-                    ? mek.message.ephemeralMessage.message
-                    : mek.message
-                if (mek.key?.remoteJid === 'status@broadcast') {
-                    await handleStatus(XeonBotInc, { ...chatUpdate, messages: [mek] })
-                    continue
-                }
-                // In private mode, only block non-group messages (allow groups for moderation).
-                if (!XeonBotInc.public && !mek.key?.fromMe && chatUpdate.type === 'notify') {
-                    const isGroup = mek.key?.remoteJid?.endsWith('@g.us')
-                    if (!isGroup) continue
-                }
-                if (mek.key?.id?.startsWith('BAE5') && mek.key.id.length === 16) continue
-
-                if (XeonBotInc.msgRetryCounterCache) {
-                    XeonBotInc.msgRetryCounterCache.clear()
-                }
-
-                await handleMessages(XeonBotInc, { ...chatUpdate, messages: [mek] }, true)
+                await handleMessages(XeonBotInc, chatUpdate, true)
             } catch (err) {
-                console.error('Error handling incoming WhatsApp message:', err)
-                const chatId = mek.key?.remoteJid
-                if (chatId) {
-                    await XeonBotInc.sendMessage(chatId, {
+                console.error("Error in handleMessages:", err)
+                // Only try to send error message if we have a valid chatId
+                if (mek.key && mek.key.remoteJid) {
+                    await XeonBotInc.sendMessage(mek.key.remoteJid, {
                         text: '❌ An error occurred while processing your message.',
                         contextInfo: {
                             forwardingScore: 1,
@@ -217,9 +189,11 @@ async function startXeonBotInc() {
                                 serverMessageId: -1
                             }
                         }
-                    }).catch(console.error)
+                    }).catch(console.error);
                 }
             }
+        } catch (err) {
+            console.error("Error in messages.upsert:", err)
         }
     })
 
@@ -263,7 +237,6 @@ async function startXeonBotInc() {
 
     // Connection handling
     XeonBotInc.ev.on('connection.update', async (s) => {
-        if (activeSocket !== XeonBotInc) return
         const { connection, lastDisconnect, qr } = s
 
         // qr firing means the WhatsApp server is ready for auth —
@@ -286,15 +259,7 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
-            await credentialsSaveQueue
-            if (activeSocket !== XeonBotInc) return
-            if (credentialSaveError) {
-                setStatus('error', {
-                    error: 'WhatsApp connected, but its session could not be saved to MongoDB. It may not reconnect after a restart.'
-                })
-            } else {
-                setStatus('connected')
-            }
+            setStatus('connected')
             console.log(chalk.magenta(` `))
             console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
 
@@ -332,27 +297,20 @@ async function startXeonBotInc() {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.forbidden
             
             console.log(chalk.red(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`))
-            activeSocket = null
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
                 try {
-                    await clearMongoAuthState(instanceId)
-                    console.log(chalk.yellow('Saved WhatsApp session cleared. Please re-authenticate.'))
+                    rmSync('./session', { recursive: true, force: true })
+                    console.log(chalk.yellow('Session folder deleted. Please re-authenticate.'))
                 } catch (error) {
                     console.error('Error deleting session:', error)
                 }
                 console.log(chalk.red('Session logged out. Please re-authenticate.'))
-                setStatus('waiting_for_number')
             }
             
-            if (shouldReconnect && !reconnectPending) {
-                reconnectPending = true
-                setStatus('restarting', {
-                    error: `WhatsApp disconnected (${statusCode || 'unknown reason'}); reconnecting.`
-                })
+            if (shouldReconnect) {
                 console.log(chalk.yellow('Reconnecting...'))
                 await delay(5000)
-                reconnectPending = false
                 startXeonBotInc()
             }
         }
@@ -401,6 +359,12 @@ async function startXeonBotInc() {
         await handleGroupParticipantUpdate(XeonBotInc, update);
     });
 
+    XeonBotInc.ev.on('messages.upsert', async (m) => {
+        if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
+            await handleStatus(XeonBotInc, m);
+        }
+    });
+
     XeonBotInc.ev.on('status.update', async (status) => {
         await handleStatus(XeonBotInc, status);
     });
@@ -412,18 +376,20 @@ async function startXeonBotInc() {
     return XeonBotInc
     } catch (error) {
         console.error('Error in startXeonBotInc:', error)
-        setStatus('error', { error: error.message })
-        if (error.code === 'AUTH_STATE_DECRYPTION_FAILED') {
-            return;
-        }
         await delay(5000)
         startXeonBotInc()
     }
 }
 
 
-startXeonBotInc().catch(error => {
-    console.error('Fatal error:', error)
+// Start web server first, then the bot
+startWebServer().then(() => {
+    startXeonBotInc().catch(error => {
+        console.error('Fatal error:', error)
+        process.exit(1)
+    })
+}).catch(error => {
+    console.error('Failed to start web server:', error)
     process.exit(1)
 })
 process.on('uncaughtException', (err) => {
@@ -432,8 +398,12 @@ process.on('uncaughtException', (err) => {
 
 process.on('unhandledRejection', (err) => {
     console.error('Unhandled Rejection:', err)
-    if (err?.code === 'AUTH_STATE_DECRYPTION_FAILED') {
-        setStatus('error', { error: err.message })
-    }
 })
 
+let file = require.resolve(__filename)
+fs.watchFile(file, () => {
+    fs.unwatchFile(file)
+    console.log(chalk.redBright(`Update ${__filename}`))
+    delete require.cache[file]
+    require(file)
+})

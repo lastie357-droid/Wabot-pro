@@ -159,28 +159,22 @@ It is lightweight and can be easily customized to add more commands as per your 
     npm install --legacy-peer-deps
     ```
 
-3. **Configure the required environment variables** in Replit Secrets (or your host's secret manager):
-
-    - `ADMIN_USERNAME` and `ADMIN_PASSWORD` for the private admin page
-    - `MONGODB_URL` for saved admin sessions, bot instances, and WhatsApp authentication
-    - `SESSION_SECRET` for signing admin sessions and encrypting WhatsApp authentication
-
-    Keep `SESSION_SECRET` unchanged after linking WhatsApp accounts.
-
-4. **Start the manager and bot:**
+3. **Run the bot:**
 
     ```bash
-    npm start
+    node index.js
     ```
 
-    Open the app, sign in, and use **Create a clone** to start another isolated bot process. Each bot needs its own WhatsApp account pairing. Saved bot instances and their encrypted WhatsApp sessions are restored from MongoDB when the server restarts.
-
-> To use Docker, export those four environment variables before running:
+> If your machine does not have Node 20 available, use Docker instead:
 >
 > ```bash
 > npm run docker:build
 > npm run docker:run
 > ```
+
+4. **Scan the QR code:**
+
+    Once the bot starts, a QR code will appear in the terminal. Scan this QR code using the Linked Devices feature in WhatsApp to connect your WhatsApp account with the bot.
 
 ---
 

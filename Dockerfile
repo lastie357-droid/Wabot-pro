@@ -30,11 +30,11 @@ RUN git config --global url."https://github.com/".insteadOf git@github.com: \
 COPY . .
 
 # Ensure runtime directories exist
-RUN mkdir -p session temp tmp data .bot-instances
+RUN mkdir -p session temp tmp data
 
-EXPOSE 5000
+EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s \
-    CMD wget -q -O- http://localhost:5000/healthz || exit 1
+    CMD wget -q -O- http://localhost:3000/api/status || exit 1
 
 CMD ["npm", "start"]
