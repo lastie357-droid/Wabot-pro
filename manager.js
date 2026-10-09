@@ -116,14 +116,45 @@ function requireAdmin(req, res, next) {
 
 function enforceSameOrigin(req, res, next) {
     const origin = req.get('origin');
-    if (origin) {
-        try {
-            if (new URL(origin).host !== req.get('host')) {
-                return res.status(403).json({ error: 'Request origin is not allowed.' });
-            }
-        } catch {
+    if (!origin) return next();
+
+    try {
+        const requestOrigin = new URL(origin);
+        if (!['http:', 'https:'].includes(requestOrigin.protocol)) {
             return res.status(403).json({ error: 'Request origin is not allowed.' });
         }
+
+        const firstHeaderValue = (value) => String(value || '').split(',')[0].trim();
+        const protocols = new Set([
+            req.protocol,
+            firstHeaderValue(req.get('x-forwarded-proto')).replace(/:$/, '').toLowerCase()
+        ].filter((value) => value === 'http' || value === 'https'));
+        const hosts = new Set([
+            firstHeaderValue(req.get('x-forwarded-host')),
+            req.get('host'),
+            req.hostname
+        ].filter(Boolean));
+        const allowedOrigins = new Set();
+
+        for (const protocol of protocols) {
+            for (const host of hosts) {
+                allowedOrigins.add(new URL(`${protocol}://${host}`).origin);
+            }
+        }
+
+        const configuredDomains = [
+            process.env.REPLIT_DEV_DOMAIN,
+            ...(process.env.REPLIT_DOMAINS || '').split(',')
+        ].map((domain) => domain.trim()).filter(Boolean);
+        for (const domain of configuredDomains) {
+            allowedOrigins.add(new URL(`https://${domain}`).origin);
+        }
+
+        if (!allowedOrigins.has(requestOrigin.origin)) {
+            return res.status(403).json({ error: 'Request origin is not allowed.' });
+        }
+    } catch {
+        return res.status(403).json({ error: 'Request origin is not allowed.' });
     }
     next();
 }
