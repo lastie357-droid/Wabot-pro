@@ -25,6 +25,11 @@ function setStatus(status, data = {}) {
 }
 
 process.on('message', (message) => {
+    if (message?.type === 'reset_for_pairing') {
+        process.exit(0);
+        return;
+    }
+
     if (message?.type !== 'phone' || typeof message.phone !== 'string') return;
     if (pendingPhoneResolve) {
         const resolve = pendingPhoneResolve;

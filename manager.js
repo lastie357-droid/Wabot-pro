@@ -216,6 +216,7 @@ h1{margin:8px 0 7px;font-size:clamp(27px,4vw,38px);letter-spacing:-.05em}.intro{
 .divider{height:1px;background:#26332e;margin:18px 0}.sub{color:#94a29b;font-size:12px;line-height:1.6;margin:0 0 12px}
 label{display:block;margin:13px 0 6px;color:#c5d0c9;font-size:12px;font-weight:600}input{width:100%;height:42px;padding:0 11px;border:1px solid #34443c;border-radius:8px;background:#0c1311;color:#f4f8f5;font-size:13px;outline:none}
 input:focus{border-color:#54c789;box-shadow:0 0 0 3px #54c78925}.pair{display:flex;gap:9px;align-items:center}.pair input{flex:1;min-width:0}.pair button{flex:0 0 auto;height:41px;padding:0 13px;border:0;border-radius:8px;background:#45c780;color:#07150d;font-size:12px;font-weight:750;cursor:pointer}.pair button:disabled{opacity:.5}
+.retry{margin-top:10px;padding:9px 12px;border:1px solid #405247;border-radius:8px;background:#17211b;color:#cfe4d7;font-size:12px;font-weight:700;cursor:pointer}.retry:hover{border-color:#45c780;color:#fff}.retry:disabled{opacity:.55;cursor:wait}
 .code{display:inline-block;margin:3px 0 8px;padding:12px 16px;border:1px solid #354439;border-radius:9px;background:#0b120e;color:#70e0a0;font:800 22px ui-monospace,SFMono-Regular,monospace;letter-spacing:.19em}.error-text{margin:0;color:#ffa69e;font-size:12px;line-height:1.5}.loading{padding:45px 15px;text-align:center;border:1px dashed #35443d;border-radius:12px;color:#84938b;font-size:13px}
 @media(max-width:600px){.shell{width:min(100% - 28px,1060px)}.topbar{height:68px}main{padding:39px 0 60px}.heading{align-items:flex-start;flex-direction:column}.primary{width:100%}.instance{padding:17px}}
 </style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">K</div><div><strong>Knight Bot</strong><span>Private instance manager</span></div></div><button class="outline" id="logout">Sign out</button></header>
@@ -227,14 +228,15 @@ function showNotice(message,isError=false){notice.textContent=message;notice.cla
 function hideNotice(){notice.style.display='none';}
 async function api(url,options={}){const response=await fetch(url,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});const body=await response.json().catch(()=>({}));if(response.status===401){location.assign('/login');throw new Error('Your session expired.');}if(!response.ok)throw new Error(body.error||'Request failed.');return body;}
 function statusText(status){return ({connected:'Connected',waiting_for_number:'Needs WhatsApp link',requesting_code:'Requesting code',waiting_for_pairing:'Pairing code ready',starting:'Starting',restarting:'Restarting',error:'Needs attention',stopped:'Stopped'})[status]||status;}
+function makeRetryButton(instance){const button=document.createElement('button');button.type='button';button.className='retry';button.textContent='Request code again';button.addEventListener('click',async()=>{if(!window.confirm('This clears this bot’s WhatsApp authentication and temporary files. Its settings and saved bot data will be kept. Continue?'))return;button.disabled=true;button.textContent='Resetting session…';try{const result=await api('/api/instances/'+encodeURIComponent(instance.id)+'/retry-pair',{method:'POST',body:'{}'});showNotice(result.message||'Session cleared. Requesting a fresh code.');await refresh();}catch(error){showNotice(error.message,true);button.disabled=false;button.textContent='Request code again';}});return button;}
 function render(instances){grid.replaceChildren();if(!instances.length){const empty=document.createElement('div');empty.className='loading';empty.textContent='No bot instances found.';grid.append(empty);return;}
 for(const instance of instances){const card=document.createElement('article');card.className='instance';
 const head=document.createElement('div');head.className='instance-head';const title=document.createElement('div');const name=document.createElement('h2');name.textContent=instance.name;const id=document.createElement('div');id.className='instance-id';id.textContent=instance.id;title.append(name,id);
 const badge=document.createElement('span');badge.className='badge '+instance.status;const dot=document.createElement('span');dot.className='dot';const label=document.createElement('span');label.textContent=statusText(instance.status);badge.append(dot,label);head.append(title,badge);card.append(head);
 const divider=document.createElement('div');divider.className='divider';card.append(divider);
 if(instance.status==='waiting_for_number'){const text=document.createElement('p');text.className='sub';text.textContent='Link a separate WhatsApp account to this bot instance.';const form=document.createElement('form');form.className='pair';const input=document.createElement('input');input.type='tel';input.inputMode='numeric';input.autocomplete='tel';input.placeholder='Country code + phone number';input.maxLength=15;input.required=true;input.setAttribute('aria-label','WhatsApp phone number');const button=document.createElement('button');button.type='submit';button.textContent='Get code';form.append(input,button);form.addEventListener('submit',async(event)=>{event.preventDefault();button.disabled=true;try{await api('/api/instances/'+encodeURIComponent(instance.id)+'/pair',{method:'POST',body:JSON.stringify({phone:input.value})});showNotice('Pairing code requested for '+instance.name+'.');await refresh();}catch(error){showNotice(error.message,true);button.disabled=false;}});card.append(text,form);}
-else if(instance.status==='waiting_for_pairing'&&instance.pairingCode){const text=document.createElement('p');text.className='sub';text.textContent='Enter this code in WhatsApp → Settings → Linked Devices → Link a Device.';const code=document.createElement('div');code.className='code';code.textContent=instance.pairingCode;card.append(text,code);}
-else if(instance.error){const text=document.createElement('p');text.className='error-text';text.textContent=instance.error;card.append(text);}
+else if(instance.status==='waiting_for_pairing'&&instance.pairingCode){const text=document.createElement('p');text.className='sub';text.textContent='Enter this code in WhatsApp → Settings → Linked Devices → Link a Device.';const code=document.createElement('div');code.className='code';code.textContent=instance.pairingCode;card.append(text,code);if(instance.canRetryPairing)card.append(makeRetryButton(instance));}
+else if(instance.error){const text=document.createElement('p');text.className='error-text';text.textContent=instance.error;card.append(text);if(instance.canRetryPairing)card.append(makeRetryButton(instance));}
 else{const text=document.createElement('p');text.className='sub';text.textContent=instance.status==='connected'?'This bot is online. Its WhatsApp session is saved and will reconnect after a server restart.':'This bot is starting. Its status will update automatically.';card.append(text);}
 grid.append(card);}}
 async function refresh(){try{const data=await api('/api/instances');render(data.instances||[]);}catch(error){if(error.message!=='Your session expired.')showNotice(error.message,true);}}
@@ -293,12 +295,15 @@ app.post('/api/logout', requireAdmin, async (req, res) => {
 
 app.get('/api/instances', requireAdmin, (_req, res) => {
     const result = [...instances.values()]
-        .map(({ id, name, state }) => ({
-            id,
-            name,
-            status: state.status,
-            pairingCode: state.pairingCode,
-            error: state.error
+        .map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            status: entry.state.status,
+            pairingCode: entry.state.pairingCode,
+            error: entry.state.error,
+            canRetryPairing: Boolean(entry.phoneNumber)
+                && ['waiting_for_pairing', 'error'].includes(entry.state.status)
+                && !entry.pairingReset
         }))
         .sort((a, b) => a.id.localeCompare(b.id));
     res.json({ instances: result });
@@ -324,19 +329,99 @@ app.post('/api/instances', requireAdmin, async (_req, res) => {
     }
 });
 
-app.post('/api/instances/:id/pair', requireAdmin, (req, res) => {
+app.post('/api/instances/:id/pair', requireAdmin, async (req, res) => {
     const entry = instances.get(req.params.id);
     const phone = typeof req.body?.phone === 'string' ? req.body.phone.replace(/\D/g, '') : '';
     if (!entry) return res.status(404).json({ error: 'Bot instance not found.' });
     if (phone.length < 7 || phone.length > 15) return res.status(400).json({ error: 'Enter a valid phone number with country code.' });
+    if (entry.pairingReset) return res.status(409).json({ error: 'This bot is already resetting for a new code.' });
     if (entry.state.status !== 'waiting_for_number') {
         return res.status(409).json({ error: 'This bot is not ready for a phone number yet.' });
     }
     if (!entry.child?.connected) return res.status(503).json({ error: 'This bot process is restarting. Try again shortly.' });
-    entry.child.send({ type: 'phone', phone });
-    entry.state = { status: 'requesting_code', pairingCode: null, error: null };
-    res.json({ ok: true });
+    beginPairingReset(entry, entry.record, phone);
+    res.json({ ok: true, message: 'Clearing old WhatsApp authentication and temporary files before requesting a code.' });
 });
+
+app.post('/api/instances/:id/retry-pair', requireAdmin, (req, res) => {
+    const entry = instances.get(req.params.id);
+    if (!entry) return res.status(404).json({ error: 'Bot instance not found.' });
+    if (!entry.phoneNumber) return res.status(409).json({ error: 'Enter the WhatsApp number again before requesting another code.' });
+    if (entry.pairingReset) return res.status(409).json({ error: 'This bot is already resetting for a new code.' });
+    if (!['waiting_for_pairing', 'error'].includes(entry.state.status)) {
+        return res.status(409).json({ error: 'A new code can only be requested while pairing or after a pairing error.' });
+    }
+
+    beginPairingReset(entry, entry.record, entry.phoneNumber);
+    res.json({ ok: true, message: 'Old WhatsApp authentication and temporary files cleared. Requesting a fresh code.' });
+});
+
+function beginPairingReset(entry, record, phone) {
+    entry.phoneNumber = phone;
+    entry.pairingReset = { phone };
+    entry.pendingPairPhone = null;
+    entry.state = { status: 'restarting', pairingCode: null, error: null };
+    updateStoredStatus(entry.id, 'restarting');
+
+    const child = entry.child;
+    if (child && child.exitCode === null) {
+        if (child.connected) {
+            child.send({ type: 'reset_for_pairing' }, (error) => {
+                if (error && entry.child === child) child.kill('SIGTERM');
+            });
+        } else {
+            child.kill('SIGTERM');
+        }
+        const forceStop = setTimeout(() => {
+            if (entry.child === child) child.kill('SIGKILL');
+        }, 8000);
+        forceStop.unref?.();
+        return;
+    }
+
+    void finishPairingReset(entry, record);
+}
+
+async function finishPairingReset(entry, record) {
+    const reset = entry.pairingReset;
+    if (!reset) return;
+    entry.pairingReset = null;
+
+    try {
+        await mongoose.connection.db.collection('knight_bot_auth').deleteMany({ instanceId: entry.id });
+        clearPairingTemporaryFiles(entry.id);
+        if (shuttingDown) return;
+        entry.pendingPairPhone = reset.phone;
+        startInstance(record);
+    } catch (error) {
+        console.error(`Could not reset pairing data for ${entry.id}:`, error.message);
+        entry.pendingPairPhone = null;
+        entry.state = {
+            status: 'error',
+            pairingCode: null,
+            error: 'Could not clear the previous WhatsApp session. Try requesting a new code again.'
+        };
+        updateStoredStatus(entry.id, 'error');
+    }
+}
+
+function clearPairingTemporaryFiles(id) {
+    const workspace = id === 'main' ? ROOT : createCloneWorkspace(id);
+    const root = path.resolve(workspace);
+    const files = [
+        'session', 'temp', 'tmp', 'auth_info_baileys',
+        '.wwebjs_auth', '.wwebjs_cache'
+    ];
+
+    for (const relative of files) {
+        const target = path.resolve(root, relative);
+        if (!target.startsWith(`${root}${path.sep}`)) throw new Error('Invalid temporary path.');
+        fs.rmSync(target, { recursive: true, force: true });
+        if (relative === 'temp' || relative === 'tmp') {
+            fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+        }
+    }
+}
 
 function createCloneWorkspace(id) {
     const instanceRoot = path.join(WORKSPACE_ROOT, id);
