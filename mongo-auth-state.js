@@ -23,24 +23,37 @@ function encrypt(value) {
     };
 }
 
-function decrypt(envelope) {
-    const decipher = crypto.createDecipheriv(
-        'aes-256-gcm',
-        getEncryptionKey(),
-        Buffer.from(envelope.iv, 'base64')
-    );
-    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-    const json = Buffer.concat([
-        decipher.update(Buffer.from(envelope.value, 'base64')),
-        decipher.final()
-    ]).toString('utf8');
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-    return JSON.parse(json, (_key, value) => {
-        if (value && value.type === 'Buffer' && Array.isArray(value.data)) {
-            return Buffer.from(value.data);
-        }
-        return value;
-    });
+function decrypt(envelope) {
+    try {
+        const decipher = crypto.createDecipheriv(
+            'aes-256-gcm',
+            getEncryptionKey(),
+            Buffer.from(envelope.iv, 'base64')
+        );
+        decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+        const json = Buffer.concat([
+            decipher.update(Buffer.from(envelope.value, 'base64')),
+            decipher.final()
+        ]).toString('utf8');
+
+        return JSON.parse(json, (_key, value) => {
+            if (value && value.type === 'Buffer' && Array.isArray(value.data)) {
+                return Buffer.from(value.data);
+            }
+            return value;
+        });
+    } catch (error) {
+        const authError = new Error(
+            'Saved WhatsApp auth data could not be decrypted. Reset this bot’s session and pair again.'
+        );
+        authError.code = 'AUTH_STATE_DECRYPTION_FAILED';
+        authError.cause = error;
+        throw authError;
+    }
 }
 
 async function ensureMongoConnection() {
@@ -54,6 +67,15 @@ async function useMongoAuthState(instanceId) {
     await ensureMongoConnection();
     const collection = mongoose.connection.db.collection('knight_bot_auth');
     const prefix = `${instanceId}:`;
+    const storedAuth = await collection.find({
+        _id: { $regex: `^${escapeRegExp(prefix)}` }
+    }).toArray();
+
+    // Validate every saved record before Baileys starts using signal keys.
+    // Otherwise a bad key can fail asynchronously and leave the worker reconnecting forever.
+    for (const document of storedAuth) {
+        if (document.encrypted) decrypt(document.encrypted);
+    }
 
     async function read(key) {
         const document = await collection.findOne({ _id: prefix + key });
@@ -114,7 +136,13 @@ async function useMongoAuthState(instanceId) {
 
 async function clearMongoAuthState(instanceId) {
     await ensureMongoConnection();
-    await mongoose.connection.db.collection('knight_bot_auth').deleteMany({ instanceId });
+    const escapedId = escapeRegExp(instanceId);
+    await mongoose.connection.db.collection('knight_bot_auth').deleteMany({
+        $or: [
+            { instanceId },
+            { _id: { $regex: `^${escapedId}:` } }
+        ]
+    });
 }
 
 async function clearMongoSignalKeys(instanceId) {

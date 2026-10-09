@@ -312,6 +312,7 @@ async function startXeonBotInc() {
                     console.error('Error deleting session:', error)
                 }
                 console.log(chalk.red('Session logged out. Please re-authenticate.'))
+                setStatus('waiting_for_number')
             }
             
             if (shouldReconnect) {
@@ -377,6 +378,9 @@ async function startXeonBotInc() {
     } catch (error) {
         console.error('Error in startXeonBotInc:', error)
         setStatus('error', { error: error.message })
+        if (error.code === 'AUTH_STATE_DECRYPTION_FAILED') {
+            return;
+        }
         await delay(5000)
         startXeonBotInc()
     }
@@ -393,5 +397,8 @@ process.on('uncaughtException', (err) => {
 
 process.on('unhandledRejection', (err) => {
     console.error('Unhandled Rejection:', err)
+    if (err?.code === 'AUTH_STATE_DECRYPTION_FAILED') {
+        setStatus('error', { error: err.message })
+    }
 })
 

@@ -5,6 +5,7 @@ const path = require('path');
 const { fork } = require('child_process');
 const express = require('express');
 const mongoose = require('mongoose');
+const { clearMongoAuthState } = require('./mongo-auth-state');
 const { createCloneWorkspace } = require('./lib/clone-workspace');
 const { resetBotWorkspace } = require('./lib/reset-bot-workspace');
 const { acquireSingleInstanceLock, releaseSingleInstanceLock } = require('./lib/single-instance-lock');
@@ -16,6 +17,9 @@ const MANAGER_LOCK_PATH = path.join(
 );
 const PORT = Number(process.env.PORT || 5000);
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const BASE_WORKER_RESTART_DELAY_MS = 3000;
+const MAX_WORKER_RESTART_DELAY_MS = 60000;
+const STABLE_WORKER_MS = 30000;
 const SESSION_COOKIE = 'knight_admin_session';
 const instances = new Map();
 const loginAttempts = new Map();
@@ -237,7 +241,7 @@ h1{margin:8px 0 7px;font-size:clamp(27px,4vw,38px);letter-spacing:-.05em}.intro{
 .divider{height:1px;background:#26332e;margin:18px 0}.sub{color:#94a29b;font-size:12px;line-height:1.6;margin:0 0 12px}
 label{display:block;margin:13px 0 6px;color:#c5d0c9;font-size:12px;font-weight:600}input{width:100%;height:42px;padding:0 11px;border:1px solid #34443c;border-radius:8px;background:#0c1311;color:#f4f8f5;font-size:13px;outline:none}
 input:focus{border-color:#54c789;box-shadow:0 0 0 3px #54c78925}.pair{display:flex;gap:9px;align-items:center}.pair input{flex:1;min-width:0}.pair button{flex:0 0 auto;height:41px;padding:0 13px;border:0;border-radius:8px;background:#45c780;color:#07150d;font-size:12px;font-weight:750;cursor:pointer}.pair button:disabled{opacity:.5}
-.retry{margin-top:10px;padding:9px 12px;border:1px solid #405247;border-radius:8px;background:#17211b;color:#cfe4d7;font-size:12px;font-weight:700;cursor:pointer}.retry:hover{border-color:#45c780;color:#fff}.retry:disabled{opacity:.55;cursor:wait}
+ .retry,.reset{margin-top:10px;padding:9px 12px;border:1px solid #405247;border-radius:8px;background:#17211b;color:#cfe4d7;font-size:12px;font-weight:700;cursor:pointer}.retry:hover{border-color:#45c780;color:#fff}.retry:disabled,.reset:disabled{opacity:.55;cursor:wait}.reset{margin-left:8px;border-color:#593b37;background:#211716;color:#ffb7ad}.reset:hover{border-color:#db776d;color:#fff}
 .code{display:inline-block;margin:3px 0 8px;padding:12px 16px;border:1px solid #354439;border-radius:9px;background:#0b120e;color:#70e0a0;font:800 22px ui-monospace,SFMono-Regular,monospace;letter-spacing:.19em}.error-text{margin:0;color:#ffa69e;font-size:12px;line-height:1.5}.loading{padding:45px 15px;text-align:center;border:1px dashed #35443d;border-radius:12px;color:#84938b;font-size:13px}
 @media(max-width:600px){.shell{width:min(100% - 28px,1060px)}.topbar{height:68px}main{padding:39px 0 60px}.heading{align-items:flex-start;flex-direction:column}.primary{width:100%}.instance{padding:17px}}
 </style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">K</div><div><strong>Knight Bot</strong><span>Private instance manager</span></div></div><button class="outline" id="logout">Sign out</button></header>
@@ -251,6 +255,7 @@ async function api(url,options={}){const response=await fetch(url,{...options,he
 function hasActiveGridControl(){const active=document.activeElement;return Boolean(active&&grid.contains(active)&&active.matches('input,textarea,select,button'));}
 function statusText(status){return ({connected:'Connected',waiting_for_number:'Needs WhatsApp link',requesting_code:'Requesting code',waiting_for_pairing:'Pairing code ready',starting:'Starting',restarting:'Restarting',error:'Needs attention',stopped:'Stopped'})[status]||status;}
 function makeRetryButton(instance){const button=document.createElement('button');button.type='button';button.className='retry';button.textContent='Request code again';button.addEventListener('click',async()=>{if(!window.confirm('This deletes this bot’s WhatsApp auth/session files and temporary files, and clears user/group records, the sudo-user list, bans, warnings, premium lists, message counts, and other unclassified data files. Bot settings, owner configuration, feature toggles, and per-group feature settings will be kept. Continue?'))return;button.disabled=true;button.textContent='Resetting session…';try{const result=await api('/api/instances/'+encodeURIComponent(instance.id)+'/retry-pair',{method:'POST',body:'{}'});showNotice(result.message||'Bot data reset. Requesting a fresh code.');await refresh();}catch(error){showNotice(error.message,true);button.disabled=false;button.textContent='Request code again';}});return button;}
+function makeResetButton(instance){const button=document.createElement('button');button.type='button';button.className='reset';button.textContent='Reset bot & settings';button.disabled=Boolean(instance.resetting);if(instance.resetting)button.textContent='Resetting…';button.addEventListener('click',async()=>{if(!window.confirm('Reset '+instance.name+'? This clears only this bot’s saved WhatsApp session, all its settings and bot data. The bot will remain listed and return to fresh phone pairing. Other bot instances are not changed.'))return;button.disabled=true;button.textContent='Resetting…';try{const result=await api('/api/instances/'+encodeURIComponent(instance.id)+'/reset',{method:'POST',body:'{}'});showNotice(result.message||'Bot reset. Enter its WhatsApp number to pair again.');button.blur();await refresh();}catch(error){showNotice(error.message,true);button.disabled=false;button.textContent='Reset bot & settings';}});return button;}
 function render(instances){const snapshot=JSON.stringify(instances);if(snapshot===renderedInstancesSnapshot)return;grid.replaceChildren();if(!instances.length){const empty=document.createElement('div');empty.className='loading';empty.textContent='No bot instances found.';grid.append(empty);renderedInstancesSnapshot=snapshot;return;}
 for(const instance of instances){const card=document.createElement('article');card.className='instance';
 const head=document.createElement('div');head.className='instance-head';const title=document.createElement('div');const name=document.createElement('h2');name.textContent=instance.name;const id=document.createElement('div');id.className='instance-id';id.textContent=instance.id;title.append(name,id);
@@ -259,7 +264,8 @@ const divider=document.createElement('div');divider.className='divider';card.app
 if(instance.status==='waiting_for_number'){const text=document.createElement('p');text.className='sub';text.textContent='Link a separate WhatsApp account to this bot instance.';const form=document.createElement('form');form.className='pair';const input=document.createElement('input');input.type='tel';input.inputMode='numeric';input.autocomplete='tel';input.placeholder='Country code + phone number';input.maxLength=15;input.required=true;input.setAttribute('aria-label','WhatsApp phone number');const button=document.createElement('button');button.type='submit';button.textContent='Get code';form.append(input,button);form.addEventListener('submit',async(event)=>{event.preventDefault();button.disabled=true;try{await api('/api/instances/'+encodeURIComponent(instance.id)+'/pair',{method:'POST',body:JSON.stringify({phone:input.value})});showNotice('Pairing code requested for '+instance.name+'.');await refresh();}catch(error){showNotice(error.message,true);button.disabled=false;}});card.append(text,form);}
 else if(instance.status==='waiting_for_pairing'&&instance.pairingCode){const text=document.createElement('p');text.className='sub';text.textContent='Enter this code in WhatsApp → Settings → Linked Devices → Link a Device.';const code=document.createElement('div');code.className='code';code.textContent=instance.pairingCode;card.append(text,code);if(instance.canRetryPairing)card.append(makeRetryButton(instance));}
 else if(instance.error){const text=document.createElement('p');text.className='error-text';text.textContent=instance.error;card.append(text);if(instance.canRetryPairing)card.append(makeRetryButton(instance));}
-else{const text=document.createElement('p');text.className='sub';text.textContent=instance.status==='connected'?'This bot is online. Its WhatsApp session is saved and will reconnect after a server restart.':'This bot is starting. Its status will update automatically.';card.append(text);}
+ else{const text=document.createElement('p');text.className='sub';text.textContent=instance.status==='connected'?'This bot is online. Its WhatsApp session is saved and will reconnect after a server restart.':'This bot is starting. Its status will update automatically.';card.append(text);}
+ card.append(makeResetButton(instance));
  grid.append(card);}renderedInstancesSnapshot=snapshot;}
 async function refresh(){if(hasActiveGridControl())return;try{const data=await api('/api/instances');if(!hasActiveGridControl())render(data.instances||[]);}catch(error){if(error.message!=='Your session expired.')showNotice(error.message,true);}}
 document.getElementById('clone').addEventListener('click',async()=>{cloneButton.disabled=true;cloneButton.textContent='Creating clone…';hideNotice();try{const data=await api('/api/instances',{method:'POST',body:'{}'});showNotice(data.message||'Clone created. Link it to a separate WhatsApp account.');await refresh();}catch(error){showNotice(error.message,true);}finally{cloneButton.disabled=false;cloneButton.innerHTML='＋ &nbsp; Create a clone';}});
@@ -323,6 +329,7 @@ app.get('/api/instances', requireAdmin, (_req, res) => {
             status: entry.state.status,
             pairingCode: entry.state.pairingCode,
             error: entry.state.error,
+            resetting: Boolean(entry.pairingReset),
             canRetryPairing: Boolean(entry.phoneNumber)
                 && ['waiting_for_pairing', 'error'].includes(entry.state.status)
                 && !entry.pairingReset
@@ -365,6 +372,23 @@ app.post('/api/instances/:id/pair', requireAdmin, async (req, res) => {
     res.json({ ok: true, message: 'Clearing old WhatsApp authentication and temporary files before requesting a code.' });
 });
 
+app.post('/api/instances/:id/reset', requireAdmin, (req, res) => {
+    const entry = instances.get(req.params.id);
+    if (!entry) return res.status(404).json({ error: 'Bot instance not found.' });
+    if (entry.pairingReset) return res.status(409).json({ error: 'This bot is already resetting.' });
+
+    entry.phoneNumber = null;
+    entry.pendingPairPhone = null;
+    beginPairingReset(entry, entry.record, null, {
+        clearBotData: true,
+        resetSettings: true
+    });
+    res.json({
+        ok: true,
+        message: 'This bot is resetting. Its saved WhatsApp session and settings were cleared; pair it again when it returns.'
+    });
+});
+
 app.post('/api/instances/:id/retry-pair', requireAdmin, (req, res) => {
     const entry = instances.get(req.params.id);
     if (!entry) return res.status(404).json({ error: 'Bot instance not found.' });
@@ -381,9 +405,17 @@ app.post('/api/instances/:id/retry-pair', requireAdmin, (req, res) => {
     });
 });
 
-function beginPairingReset(entry, record, phone, { clearBotData = false } = {}) {
-    entry.phoneNumber = phone;
-    entry.pairingReset = { phone, clearBotData };
+function beginPairingReset(entry, record, phone, {
+    clearBotData = false,
+    resetSettings = false
+} = {}) {
+    if (entry.restartTimer) {
+        clearTimeout(entry.restartTimer);
+        entry.restartTimer = null;
+    }
+    entry.restartAttempts = 0;
+    entry.phoneNumber = phone || null;
+    entry.pairingReset = { phone: phone || null, clearBotData, resetSettings };
     entry.pendingPairPhone = null;
     entry.state = { status: 'restarting', pairingCode: null, error: null };
     updateStoredStatus(entry.id, 'restarting');
@@ -410,15 +442,19 @@ function beginPairingReset(entry, record, phone, { clearBotData = false } = {}) 
 async function finishPairingReset(entry, record) {
     const reset = entry.pairingReset;
     if (!reset) return;
-    entry.pairingReset = null;
 
     try {
-        await mongoose.connection.db.collection('knight_bot_auth').deleteMany({ instanceId: entry.id });
-        clearPairingTemporaryFiles(entry.id, reset.clearBotData);
-        if (shuttingDown) return;
-        entry.pendingPairPhone = reset.phone;
+        await clearMongoAuthState(entry.id);
+        clearPairingTemporaryFiles(entry.id, reset.clearBotData, reset.resetSettings);
+        if (shuttingDown) {
+            entry.pairingReset = null;
+            return;
+        }
+        entry.pairingReset = null;
+        entry.pendingPairPhone = reset.phone || null;
         startInstance(record);
     } catch (error) {
+        entry.pairingReset = null;
         console.error(`Could not reset pairing data for ${entry.id}:`, error.message);
         entry.pendingPairPhone = null;
         entry.state = {
@@ -430,9 +466,9 @@ async function finishPairingReset(entry, record) {
     }
 }
 
-function clearPairingTemporaryFiles(id, clearBotData = false) {
+function clearPairingTemporaryFiles(id, clearBotData = false, resetSettings = false) {
     const workspace = id === 'main' ? ROOT : createCloneWorkspace(ROOT, id);
-    resetBotWorkspace(workspace, { clearBotData });
+    resetBotWorkspace(workspace, { clearBotData, resetSettings });
 }
 
 function workerEnvironment(id) {
@@ -455,8 +491,13 @@ function updateStoredStatus(id, status) {
 function startInstance(record) {
     if (shuttingDown) return;
     const id = record.id;
-    const existingChild = instances.get(id)?.child;
+    const existingEntry = instances.get(id);
+    const existingChild = existingEntry?.child;
     if (!id || (existingChild && existingChild.exitCode === null)) return;
+    if (existingEntry?.restartTimer) {
+        clearTimeout(existingEntry.restartTimer);
+        existingEntry.restartTimer = null;
+    }
     let cwd = ROOT;
     if (id !== 'main') {
         try {
@@ -473,11 +514,13 @@ function startInstance(record) {
     const entry = instances.get(id) || {
         id,
         name: record.name || (id === 'main' ? 'Knight Bot' : id),
-        state: { status: 'starting', pairingCode: null, error: null }
+        state: { status: 'starting', pairingCode: null, error: null },
+        restartAttempts: 0
     };
     entry.name = record.name || entry.name;
     entry.record = record;
     entry.state = { status: 'starting', pairingCode: null, error: null };
+    entry.startedAt = Date.now();
     instances.set(id, entry);
 
     const child = fork(path.join(cwd, 'index.js'), [], {
@@ -526,13 +569,29 @@ function startInstance(record) {
             void finishPairingReset(entry, entry.record || record);
             return;
         }
+        if (Date.now() - (entry.startedAt || Date.now()) >= STABLE_WORKER_MS) {
+            entry.restartAttempts = 0;
+        }
+        entry.restartAttempts = (entry.restartAttempts || 0) + 1;
+        const restartDelay = Math.min(
+            BASE_WORKER_RESTART_DELAY_MS * (2 ** Math.min(entry.restartAttempts - 1, 5)),
+            MAX_WORKER_RESTART_DELAY_MS
+        );
         entry.state = {
             status: 'restarting',
             pairingCode: null,
-            error: code === 0 ? null : `Bot stopped unexpectedly (${signal || `exit ${code}`}); restarting.`
+            error: `Bot stopped unexpectedly (${signal || `exit ${code}`}); retrying in ${Math.ceil(restartDelay / 1000)}s.`
         };
         updateStoredStatus(id, 'restarting');
-        if (!shuttingDown) setTimeout(() => startInstance(record), 3000);
+        if (!shuttingDown) {
+            const timer = setTimeout(() => {
+                if (entry.restartTimer !== timer) return;
+                entry.restartTimer = null;
+                startInstance(record);
+            }, restartDelay);
+            entry.restartTimer = timer;
+            timer.unref?.();
+        }
     });
 }
 
@@ -567,6 +626,10 @@ async function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
     for (const entry of instances.values()) {
+        if (entry.restartTimer) {
+            clearTimeout(entry.restartTimer);
+            entry.restartTimer = null;
+        }
         if (entry.child?.connected) entry.child.kill('SIGTERM');
     }
     await Promise.all([
