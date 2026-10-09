@@ -103,7 +103,7 @@ async function startXeonBotInc() {
                 pairingPhoneNumber = String(global.phoneNumber).replace(/[^0-9]/g, '')
             } else {
                 setStatus('waiting_for_number')
-                console.log(chalk.cyan('🌐 Open the web UI in your browser and enter your WhatsApp number to get a pairing code.'))
+                console.log(chalk.cyan('🌐 Sign in to the private bot manager to link this WhatsApp account.'))
                 pairingPhoneNumber = (await waitForPhoneNumber()).replace(/[^0-9]/g, '')
             }
             const pn = require('awesome-phonenumber')

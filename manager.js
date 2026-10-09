@@ -137,6 +137,7 @@ app.use((_req, res, next) => {
     next();
 });
 app.use('/api', enforceSameOrigin);
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 const LOGIN_PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -220,6 +221,8 @@ app.get('/login', async (req, res) => {
         res.status(503).send('The session database is temporarily unavailable.');
     }
 });
+
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 app.get('/', async (req, res) => {
     try {

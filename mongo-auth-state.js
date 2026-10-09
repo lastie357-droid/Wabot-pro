@@ -80,7 +80,14 @@ async function useMongoAuthState(instanceId) {
                 document._id.slice(prefix.length),
                 document.encrypted ? decrypt(document.encrypted) : null
             ]));
-            return Object.fromEntries(names.map((name) => [name.slice(type.length + 1), values.get(name)]));
+            const result = {};
+            for (const name of names) {
+                const value = values.get(name);
+                if (value !== null && value !== undefined) {
+                    result[name.slice(type.length + 1)] = value;
+                }
+            }
+            return result;
         },
         async set(data) {
             const operations = [];
@@ -110,4 +117,13 @@ async function clearMongoAuthState(instanceId) {
     await mongoose.connection.db.collection('knight_bot_auth').deleteMany({ instanceId });
 }
 
-module.exports = { useMongoAuthState, clearMongoAuthState };
+async function clearMongoSignalKeys(instanceId) {
+    await ensureMongoConnection();
+    const result = await mongoose.connection.db.collection('knight_bot_auth').deleteMany({
+        instanceId,
+        _id: { $ne: `${instanceId}:creds` }
+    });
+    return result.deletedCount || 0;
+}
+
+module.exports = { useMongoAuthState, clearMongoAuthState, clearMongoSignalKeys };

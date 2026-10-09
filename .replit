@@ -23,12 +23,13 @@ name = "Start application"
 author = "agent"
 
 [workflows.workflow.metadata]
-outputType = "console"
+outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "while true; do npm start; echo '🔄 Bot exited, restarting in 3s...'; sleep 3; done"
+args = "npm start"
+waitForPort = 5000
 
 [[ports]]
-localPort = 3000
-externalPort = 80
+localPort = 5000
+externalPort = 5000
