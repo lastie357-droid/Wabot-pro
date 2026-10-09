@@ -61,6 +61,8 @@ const store = require('./lib/lightweight_store')
 store.readFromFile()
 const settings = require('./settings')
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000)
+let activeSocket = null
+let reconnectPending = false
 
 // Memory optimization - Force garbage collection if available
 setInterval(() => {
@@ -148,43 +150,63 @@ async function startXeonBotInc() {
             connectTimeoutMs: 260000,
             keepAliveIntervalMs: 90000,
         })
+        activeSocket = XeonBotInc
 
-        // Save credentials when they update
-        XeonBotInc.ev.on('creds.update', saveCreds)
+        // Serialize credential writes so an older update cannot finish after a newer one.
+        let credentialsSaveQueue = Promise.resolve()
+        let credentialSaveError = null
+        XeonBotInc.ev.on('creds.update', () => {
+            credentialsSaveQueue = credentialsSaveQueue
+                .then(() => saveCreds())
+                .then(() => {
+                    const hadSaveError = credentialSaveError
+                    credentialSaveError = null
+                    if (hadSaveError && activeSocket === XeonBotInc && XeonBotInc.user) {
+                        setStatus('connected')
+                    }
+                })
+                .catch((error) => {
+                    credentialSaveError = error
+                    console.error('Could not save WhatsApp credentials to MongoDB:', error.message)
+                    setStatus('error', {
+                        error: 'WhatsApp connected, but its session could not be saved to MongoDB. It may not reconnect after a restart.'
+                    })
+                })
+            return credentialsSaveQueue
+        })
 
     store.bind(XeonBotInc.ev)
 
     // Message handling
     XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
-        try {
-            const mek = chatUpdate.messages[0]
-            if (!mek.message) return
-            mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
-            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
-                await handleStatus(XeonBotInc, chatUpdate);
-                return;
-            }
-            // In private mode, only block non-group messages (allow groups for moderation)
-            // Note: XeonBotInc.public is not synced, so we check mode in main.js instead
-            // This check is kept for backward compatibility but mainly blocks DMs
-            if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') {
-                const isGroup = mek.key?.remoteJid?.endsWith('@g.us')
-                if (!isGroup) return // Block DMs in private mode, but allow group messages
-            }
-            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
-
-            // Clear message retry cache to prevent memory bloat
-            if (XeonBotInc?.msgRetryCounterCache) {
-                XeonBotInc.msgRetryCounterCache.clear()
-            }
-
+        for (const mek of chatUpdate.messages || []) {
+            if (activeSocket !== XeonBotInc) return
             try {
-                await handleMessages(XeonBotInc, chatUpdate, true)
+                if (!mek?.message) continue
+                mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage')
+                    ? mek.message.ephemeralMessage.message
+                    : mek.message
+                if (mek.key?.remoteJid === 'status@broadcast') {
+                    await handleStatus(XeonBotInc, { ...chatUpdate, messages: [mek] })
+                    continue
+                }
+                // In private mode, only block non-group messages (allow groups for moderation).
+                if (!XeonBotInc.public && !mek.key?.fromMe && chatUpdate.type === 'notify') {
+                    const isGroup = mek.key?.remoteJid?.endsWith('@g.us')
+                    if (!isGroup) continue
+                }
+                if (mek.key?.id?.startsWith('BAE5') && mek.key.id.length === 16) continue
+
+                if (XeonBotInc.msgRetryCounterCache) {
+                    XeonBotInc.msgRetryCounterCache.clear()
+                }
+
+                await handleMessages(XeonBotInc, { ...chatUpdate, messages: [mek] }, true)
             } catch (err) {
-                console.error("Error in handleMessages:", err)
-                // Only try to send error message if we have a valid chatId
-                if (mek.key && mek.key.remoteJid) {
-                    await XeonBotInc.sendMessage(mek.key.remoteJid, {
+                console.error('Error handling incoming WhatsApp message:', err)
+                const chatId = mek.key?.remoteJid
+                if (chatId) {
+                    await XeonBotInc.sendMessage(chatId, {
                         text: '❌ An error occurred while processing your message.',
                         contextInfo: {
                             forwardingScore: 1,
@@ -195,11 +217,9 @@ async function startXeonBotInc() {
                                 serverMessageId: -1
                             }
                         }
-                    }).catch(console.error);
+                    }).catch(console.error)
                 }
             }
-        } catch (err) {
-            console.error("Error in messages.upsert:", err)
         }
     })
 
@@ -243,6 +263,7 @@ async function startXeonBotInc() {
 
     // Connection handling
     XeonBotInc.ev.on('connection.update', async (s) => {
+        if (activeSocket !== XeonBotInc) return
         const { connection, lastDisconnect, qr } = s
 
         // qr firing means the WhatsApp server is ready for auth —
@@ -265,7 +286,15 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
-            setStatus('connected')
+            await credentialsSaveQueue
+            if (activeSocket !== XeonBotInc) return
+            if (credentialSaveError) {
+                setStatus('error', {
+                    error: 'WhatsApp connected, but its session could not be saved to MongoDB. It may not reconnect after a restart.'
+                })
+            } else {
+                setStatus('connected')
+            }
             console.log(chalk.magenta(` `))
             console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
 
@@ -303,6 +332,7 @@ async function startXeonBotInc() {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.forbidden
             
             console.log(chalk.red(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`))
+            activeSocket = null
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
                 try {
@@ -315,9 +345,14 @@ async function startXeonBotInc() {
                 setStatus('waiting_for_number')
             }
             
-            if (shouldReconnect) {
+            if (shouldReconnect && !reconnectPending) {
+                reconnectPending = true
+                setStatus('restarting', {
+                    error: `WhatsApp disconnected (${statusCode || 'unknown reason'}); reconnecting.`
+                })
                 console.log(chalk.yellow('Reconnecting...'))
                 await delay(5000)
+                reconnectPending = false
                 startXeonBotInc()
             }
         }

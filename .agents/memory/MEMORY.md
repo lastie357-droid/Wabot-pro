@@ -1,0 +1,1 @@
+- [Mongo session key stability](mongo-session-key-stability.md) — changing SESSION_SECRET makes existing encrypted WhatsApp auth records unreadable.
